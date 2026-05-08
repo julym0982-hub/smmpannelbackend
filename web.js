@@ -97,25 +97,32 @@ app.post("/api/auth/signup", async (req, res) => {
   } catch (e) { console.error("[SIGNUP ERR]", e.message); res.status(500).json({ message: "Server error: " + e.message }); }
 });
 
-/* ── LOGIN ───────────────────────────────────────────────── */
+/* ── LOGIN (email OR username) ───────────────────────────── */
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { password } = req.body;
-    const email = norm(req.body.email);
+    const input = String(req.body.email || "").trim(); // username or email
 
-    if (!email || !password) return res.status(400).json({ message: "Please fill all fields" });
+    if (!input || !password) return res.status(400).json({ message: "Please fill all fields" });
 
-    const user = await User.findOne({ email });
+    // Search by email (lowercase) OR by name (username, case-insensitive)
+    const user = await User.findOne({
+      $or: [
+        { email: input.toLowerCase() },
+        { name: { $regex: `^${input}$`, $options: "i" } },
+      ],
+    });
+
     if (!user) {
-      console.log("[LOGIN FAIL] not found:", email);
-      return res.status(401).json({ message: "Invalid email or password" });
+      console.log("[LOGIN FAIL] not found:", input);
+      return res.status(401).json({ message: "Invalid username or password" });
     }
 
-    console.log("[LOGIN ATTEMPT]", email, "| stored hash:", user.password.slice(0,10));
+    console.log("[LOGIN ATTEMPT]", input, "| stored hash:", user.password.slice(0,10));
     const ok = await bcrypt.compare(password, user.password);
     console.log("[LOGIN COMPARE]", ok ? "MATCH ✅" : "NO MATCH ❌");
 
-    if (!ok) return res.status(401).json({ message: "Invalid email or password" });
+    if (!ok) return res.status(401).json({ message: "Invalid username or password" });
 
     res.json({ message: "Login successful", token: token(user._id), user: safe(user) });
   } catch (e) { console.error("[LOGIN ERR]", e.message); res.status(500).json({ message: "Server error: " + e.message }); }
