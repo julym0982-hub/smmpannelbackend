@@ -7,21 +7,19 @@
 "use strict";
 
 require("dotenv").config();
-const express    = require("express");
-const mongoose   = require("mongoose");
-const bcrypt     = require("bcryptjs");
-const jwt        = require("jsonwebtoken");
-const cors       = require("cors");
+const express  = require("express");
+const mongoose = require("mongoose");
+const bcrypt   = require("bcryptjs");
+const jwt      = require("jsonwebtoken");
 
 // ──────────────────────────────────────────────────────────────
 //  ENV & CONSTANTS
 // ──────────────────────────────────────────────────────────────
-const PORT         = process.env.PORT         || 5000;
-const MONGODB_URI  = process.env.MONGODB_URI;
-const JWT_SECRET   = process.env.JWT_SECRET   || "change_me_in_env";
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://smmpannelfrontend.vercel.app";
-const JWT_EXPIRES  = "7d";
-const SALT_ROUNDS  = 12;
+const PORT        = process.env.PORT       || 5000;
+const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET  = process.env.JWT_SECRET || "change_me_in_env";
+const JWT_EXPIRES = "7d";
+const SALT_ROUNDS = 12;
 
 if (!MONGODB_URI) {
   console.error("❌  MONGODB_URI is not set in .env");
@@ -33,27 +31,33 @@ if (!MONGODB_URI) {
 // ──────────────────────────────────────────────────────────────
 const app = express();
 
-// ── CORS ──────────────────────────────────────────────────────
-const allowedOrigins = [
-  FRONTEND_URL,
+// ── CORS — Manual headers (most reliable for Render + Vercel) ─
+const ALLOWED_ORIGINS = [
+  "https://smmpannelfrontend.vercel.app",
   "http://localhost:3000",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
   "http://127.0.0.1:3000",
 ];
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      // Allow requests with no origin (Postman, curl, etc.)
-      if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-      cb(new Error(`CORS blocked: ${origin}`));
-    },
-    credentials:    true,
-    methods:        ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Set CORS headers for every response
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+
+  // ✅ Respond to preflight (OPTIONS) immediately — this is the key fix
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 
 app.use(express.json());
 
@@ -68,12 +72,12 @@ const userSchema = new mongoose.Schema(
       trim:     true,
     },
     email: {
-      type:     String,
-      required: [true, "Email is required"],
-      unique:   true,
+      type:      String,
+      required:  [true, "Email is required"],
+      unique:    true,
       lowercase: true,
-      trim:     true,
-      match:    [/^\S+@\S+\.\S+$/, "Invalid email format"],
+      trim:      true,
+      match:     [/^\S+@\S+\.\S+$/, "Invalid email format"],
     },
     password: {
       type:      String,
@@ -104,13 +108,10 @@ const User = mongoose.model("User", userSchema);
 // ──────────────────────────────────────────────────────────────
 //  HELPERS
 // ──────────────────────────────────────────────────────────────
-
-/** Sign and return a JWT */
 function signToken(userId) {
   return jwt.sign({ id: userId }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 }
 
-/** Safe user object to return (no password) */
 function safeUser(user) {
   return {
     id:           user._id,
@@ -156,7 +157,6 @@ app.post("/api/auth/signup", async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    // Validation
     if (!name || !email || !password) {
       return res.status(400).json({ message: "Please fill in all fields" });
     }
@@ -164,13 +164,11 @@ app.post("/api/auth/signup", async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     }
 
-    // Duplicate check
     const exists = await User.findOne({ email });
     if (exists) {
       return res.status(400).json({ message: "Email is already registered" });
     }
 
-    // Create user (password hashed by pre-save hook)
     const user = await User.create({ name, email, password });
 
     return res.status(201).json({
@@ -215,7 +213,6 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // ── POST /api/auth/reset-password ────────────────────────────
-//  Direct reset: user provides email + new password
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { email, newPassword } = req.body;
@@ -232,7 +229,6 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(404).json({ message: "No account found with this email" });
     }
 
-    // Hash new password manually (bypassing pre-save for clarity)
     user.password = await bcrypt.hash(newPassword, SALT_ROUNDS);
     await user.save({ validateBeforeSave: false });
 
