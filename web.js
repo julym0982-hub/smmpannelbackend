@@ -19,7 +19,7 @@ const cors       = require("cors");
 const PORT         = process.env.PORT         || 5000;
 const MONGODB_URI  = process.env.MONGODB_URI;
 const JWT_SECRET   = process.env.JWT_SECRET   || "change_me_in_env";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://smmpannelfrontend.vercel.app";
 const JWT_EXPIRES  = "7d";
 const SALT_ROUNDS  = 12;
 
