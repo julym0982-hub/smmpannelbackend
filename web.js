@@ -186,6 +186,33 @@ app.get("/api/auth/me", guard, async (req, res) => {
   }
 });
 
+/* ── CHANGE PASSWORD ─────────────────────────── */
+app.post("/api/auth/change-password", guard, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ message: "Both fields are required" });
+    if (newPassword.length < 6)
+      return res.status(400).json({ message: "New password must be at least 6 characters" });
+
+    const user = await User.findById(req.uid);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const ok = await bcrypt.compare(currentPassword, user.password);
+    if (!ok)
+      return res.status(401).json({ message: "Current password is incorrect" });
+
+    const hash = await bcrypt.hash(newPassword, 12);
+    await User.updateOne({ _id: req.uid }, { $set: { password: hash } });
+
+    console.log("[CHPW OK]", user.email);
+    res.json({ message: "Password changed successfully" });
+  } catch (e) {
+    console.error("[CHPW ERR]", e.message);
+    res.status(500).json({ message: "Server error: " + e.message });
+  }
+});
+
 /* 404 */
 app.use((_, res) => res.status(404).json({ message: "Route not found" }));
 
