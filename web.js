@@ -147,7 +147,7 @@ function guard(req, res, next) {
      order    → Order ID    (for status / cancel / refill)
    Format: application/x-www-form-urlencoded (NOT JSON)
 ══════════════════════════════════════════════════════════ */
-async function brotherAPI(params) {
+async function brotherAPI(params, _retry = false) {
   // ── Build Form Data payload ──────────────────────────
   const payload = new URLSearchParams();
   payload.append("key",    process.env.BROTHER_API_KEY);
@@ -165,8 +165,9 @@ async function brotherAPI(params) {
     payload.append("order", String(params.order));
   }
 
-  // ── Log outgoing request ─────────────────────────────
   const url = process.env.BROTHER_API_URL || "https://brothersmm.com/api";
+
+  // ── Log outgoing request ─────────────────────────────
   console.log("━━━ [BrotherSMM] REQUEST ━━━");
   console.log("URL     :", url);
   console.log("Payload :", Object.fromEntries(payload));
@@ -177,8 +178,17 @@ async function brotherAPI(params) {
       payload.toString(),
       {
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent":   "Mozilla/5.0 (compatible; SMM-Panel/1.0)",
+          "Content-Type":     "application/x-www-form-urlencoded",
+          "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept":           "application/json, text/javascript, */*; q=0.01",
+          "Accept-Language":  "en-US,en;q=0.9",
+          "Accept-Encoding":  "gzip, deflate, br",
+          "Referer":          "https://brothersmm.com/",
+          "Origin":           "https://brothersmm.com",
+          "X-Requested-With": "XMLHttpRequest",
+          "Connection":       "keep-alive",
+          "Cache-Control":    "no-cache",
+          "Pragma":           "no-cache",
         },
         timeout: 25000,
       }
@@ -189,7 +199,7 @@ async function brotherAPI(params) {
     console.log("HTTP Status :", status);
     console.log("Body        :", JSON.stringify(data));
 
-    // Provider errors arrive as HTTP 200 with { error: "..." }
+    // Provider errors come as HTTP 200 with { error: "..." }
     if (data && data.error) {
       console.error("[BrotherSMM] Provider error:", data.error);
       throw new Error(String(data.error));
@@ -198,12 +208,21 @@ async function brotherAPI(params) {
     return data;
 
   } catch (err) {
-    // ── Log error detail ─────────────────────────────────
     console.error("━━━ [BrotherSMM] ERROR ━━━");
 
     if (err.response) {
       console.error("HTTP Status  :", err.response.status);
       console.error("Response Body:", JSON.stringify(err.response.data));
+
+      // Retry once on 403 / 429 / 503
+      const retryable = [403, 429, 503].includes(err.response.status);
+      if (retryable && !_retry) {
+        const wait = err.response.status === 429 ? 3000 : 1000;
+        console.log(`[BrotherSMM] Retrying in ${wait}ms (status ${err.response.status})...`);
+        await new Promise(r => setTimeout(r, wait));
+        return brotherAPI(params, true);
+      }
+
       const msg = err.response.data?.error
                || err.response.data?.message
                || `HTTP ${err.response.status}`;
@@ -211,7 +230,12 @@ async function brotherAPI(params) {
     }
 
     if (err.request) {
-      console.error("No response — timeout or network error");
+      if (!_retry) {
+        console.log("[BrotherSMM] Timeout — retrying in 1s...");
+        await new Promise(r => setTimeout(r, 1000));
+        return brotherAPI(params, true);
+      }
+      console.error("No response — timeout/network error");
       throw new Error("[BrotherSMM] No response from provider (timeout/network)");
     }
 
@@ -220,7 +244,6 @@ async function brotherAPI(params) {
     throw new Error("[BrotherSMM] " + err.message);
   }
 }
-
 /* ══════════════════════════════════════════════════════════
    ROUTES — AUTH
 ══════════════════════════════════════════════════════════ */
