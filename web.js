@@ -148,66 +148,75 @@ function guard(req, res, next) {
    Format: application/x-www-form-urlencoded (NOT JSON)
 ══════════════════════════════════════════════════════════ */
 async function brotherAPI(params) {
+  // ── Build Form Data payload ──────────────────────────
+  const payload = new URLSearchParams();
+  payload.append("key",    process.env.BROTHER_API_KEY);
+  payload.append("action", params.action);
+
+  if (params.action === "add") {
+    payload.append("service",  String(params.service));
+    payload.append("link",     String(params.link));
+    payload.append("quantity", String(params.quantity));
+    if (params.runs)     payload.append("runs",     String(params.runs));
+    if (params.interval) payload.append("interval", String(params.interval));
+  }
+
+  if (["status","cancel","refill","mass_status"].includes(params.action)) {
+    payload.append("order", String(params.order));
+  }
+
+  // ── Log outgoing request ─────────────────────────────
+  const url = process.env.BROTHER_API_URL || "https://brothersmm.com/api";
+  console.log("━━━ [BrotherSMM] REQUEST ━━━");
+  console.log("URL     :", url);
+  console.log("Payload :", Object.fromEntries(payload));
+
   try {
-    // Build payload with correct Brother SMM parameter names
-    const payload = new URLSearchParams();
-    payload.append("key",    BROTHER_API_KEY);   // ✅ "key" not "apiKey"
-    payload.append("action", params.action);      // ✅ "action" not "actionType"
-
-    // Add-order specific params
-    if (params.action === "add") {
-      payload.append("service",  String(params.service));   // ✅ "service"
-      payload.append("link",     String(params.link));      // ✅ "link"
-      payload.append("quantity", String(params.quantity));  // ✅ "quantity"
-      // Optional drip-feed params
-      if (params.runs)     payload.append("runs",     String(params.runs));
-      if (params.interval) payload.append("interval", String(params.interval));
-    }
-
-    // Status / cancel / refill — need order ID
-    if (["status","cancel","refill"].includes(params.action)) {
-      payload.append("order", String(params.order));        // ✅ "order" not "orderID"
-    }
-
-    // Mass status — comma-separated order IDs
-    if (params.action === "mass_status") {
-      payload.append("order", String(params.order));
-    }
-
-    const { data } = await axios.post(
-      BROTHER_API_URL,
+    const { status, data } = await axios.post(
+      url,
       payload.toString(),
       {
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded", // ✅ required
+          "Content-Type": "application/x-www-form-urlencoded",
           "User-Agent":   "Mozilla/5.0 (compatible; SMM-Panel/1.0)",
         },
         timeout: 25000,
       }
     );
 
-    // Provider returns error inside JSON body as { error: "..." }
+    // ── Log success response ─────────────────────────────
+    console.log("━━━ [BrotherSMM] RESPONSE ━━━");
+    console.log("HTTP Status :", status);
+    console.log("Body        :", JSON.stringify(data));
+
+    // Provider errors arrive as HTTP 200 with { error: "..." }
     if (data && data.error) {
+      console.error("[BrotherSMM] Provider error:", data.error);
       throw new Error(String(data.error));
     }
 
     return data;
 
   } catch (err) {
+    // ── Log error detail ─────────────────────────────────
+    console.error("━━━ [BrotherSMM] ERROR ━━━");
+
     if (err.response) {
-      const providerMsg = err.response.data?.error
-        || err.response.data?.message
-        || `Provider HTTP ${err.response.status}`;
-      console.error("[BrotherSMM HTTP Error]", err.response.status, providerMsg);
-      throw new Error("[BrotherSMM] " + providerMsg);
+      console.error("HTTP Status  :", err.response.status);
+      console.error("Response Body:", JSON.stringify(err.response.data));
+      const msg = err.response.data?.error
+               || err.response.data?.message
+               || `HTTP ${err.response.status}`;
+      throw new Error("[BrotherSMM] " + msg);
     }
+
     if (err.request) {
-      console.error("[BrotherSMM Timeout] No response received");
+      console.error("No response — timeout or network error");
       throw new Error("[BrotherSMM] No response from provider (timeout/network)");
     }
-    // Re-throw if already formatted (e.g. provider error from body)
+
+    console.error("Error:", err.message);
     if (err.message.startsWith("[BrotherSMM]")) throw err;
-    console.error("[BrotherSMM Error]", err.message);
     throw new Error("[BrotherSMM] " + err.message);
   }
 }
