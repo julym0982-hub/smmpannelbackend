@@ -138,43 +138,76 @@ function guard(req, res, next) {
 /* ══════════════════════════════════════════════════════════
    BROTHER SMM API HELPER
    ─────────────────────────────────────────────────────────
-   Per Brother SMM docs:
-     Method  : POST
-     Content : application/x-www-form-urlencoded  ← KEY FIX
-     apiKey  : your API key
-     actionType: add | services | status | ...
+   Correct parameter names (Brother SMM standard):
+     key      → API key
+     action   → add | services | status | mass_status | ...
+     service  → Service ID  (for add)
+     link     → URL         (for add)
+     quantity → Quantity    (for add)
+     order    → Order ID    (for status / cancel / refill)
+   Format: application/x-www-form-urlencoded (NOT JSON)
 ══════════════════════════════════════════════════════════ */
 async function brotherAPI(params) {
-  const payload = qs.stringify({
-    apiKey: BROTHER_API_KEY,   // parameter name: apiKey
-    ...params,                 // actionType, orderType, etc.
-  });
-
   try {
-    const { data } = await axios.post(BROTHER_API_URL, payload, {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded", // required by docs
-      },
-      timeout: 20000,
-    });
+    // Build payload with correct Brother SMM parameter names
+    const payload = new URLSearchParams();
+    payload.append("key",    BROTHER_API_KEY);   // ✅ "key" not "apiKey"
+    payload.append("action", params.action);      // ✅ "action" not "actionType"
 
-    // Brother SMM returns error as { error: "..." } in the JSON body
-    if (data && data.error) {
-      throw new Error(data.error);
+    // Add-order specific params
+    if (params.action === "add") {
+      payload.append("service",  String(params.service));   // ✅ "service"
+      payload.append("link",     String(params.link));      // ✅ "link"
+      payload.append("quantity", String(params.quantity));  // ✅ "quantity"
+      // Optional drip-feed params
+      if (params.runs)     payload.append("runs",     String(params.runs));
+      if (params.interval) payload.append("interval", String(params.interval));
     }
+
+    // Status / cancel / refill — need order ID
+    if (["status","cancel","refill"].includes(params.action)) {
+      payload.append("order", String(params.order));        // ✅ "order" not "orderID"
+    }
+
+    // Mass status — comma-separated order IDs
+    if (params.action === "mass_status") {
+      payload.append("order", String(params.order));
+    }
+
+    const { data } = await axios.post(
+      BROTHER_API_URL,
+      payload.toString(),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded", // ✅ required
+          "User-Agent":   "Mozilla/5.0 (compatible; SMM-Panel/1.0)",
+        },
+        timeout: 25000,
+      }
+    );
+
+    // Provider returns error inside JSON body as { error: "..." }
+    if (data && data.error) {
+      throw new Error(String(data.error));
+    }
+
     return data;
 
   } catch (err) {
     if (err.response) {
-      // HTTP error from provider
-      const msg = err.response.data?.error
+      const providerMsg = err.response.data?.error
         || err.response.data?.message
         || `Provider HTTP ${err.response.status}`;
-      throw new Error("[BrotherSMM] " + msg);
+      console.error("[BrotherSMM HTTP Error]", err.response.status, providerMsg);
+      throw new Error("[BrotherSMM] " + providerMsg);
     }
     if (err.request) {
-      throw new Error("[BrotherSMM] No response from provider (timeout or network error)");
+      console.error("[BrotherSMM Timeout] No response received");
+      throw new Error("[BrotherSMM] No response from provider (timeout/network)");
     }
+    // Re-throw if already formatted (e.g. provider error from body)
+    if (err.message.startsWith("[BrotherSMM]")) throw err;
+    console.error("[BrotherSMM Error]", err.message);
     throw new Error("[BrotherSMM] " + err.message);
   }
 }
@@ -333,7 +366,7 @@ app.get("/api/provider/services", guard, async (req, res) => {
     }
 
     // Fetch from Brother SMM — actionType: "services"
-    const raw = await brotherAPI({ actionType: "services" });
+    const raw = await brotherAPI({ action: "services" });
 
     /*
      * Brother SMM response format (Object, NOT Array):
@@ -390,7 +423,7 @@ app.get("/api/provider/services", guard, async (req, res) => {
  */
 app.get("/api/provider/balance", guard, async (req, res) => {
   try {
-    const data = await brotherAPI({ actionType: "balance" });
+    const data = await brotherAPI({ action: "balance" });
     res.json(data);
   } catch (e) {
     console.error("[BAL ERR]", e.message);
@@ -457,10 +490,10 @@ app.post("/api/orders", guard, async (req, res) => {
     let providerRes;
     try {
       providerRes = await brotherAPI({
-        actionType:    "add",
-        orderType:     serviceId,    // Service ID
-        orderUrl:      link,
-        orderQuantity: quantity,
+        action:   "add",        // ✅ correct param
+        service:  serviceId,    // ✅ "service" not "orderType"
+        link:     link,         // ✅ "link"  not "orderUrl"
+        quantity: quantity,     // ✅ "quantity" not "orderQuantity"
       });
     } catch (provErr) {
       // Refund on provider failure
@@ -562,8 +595,8 @@ app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
       return res.status(400).json({ message: "No provider order ID" });
 
     const data = await brotherAPI({
-      actionType: "status",
-      orderID:    order.providerOrderId,
+      action: "status",               // ✅
+      order:  order.providerOrderId,  // ✅ "order" not "orderID"
     });
 
     order.status         = data.orderStatus              || order.status;
@@ -598,8 +631,8 @@ app.post("/api/orders/sync-bulk", guard, async (req, res) => {
       return res.json({ message: "No provider IDs found", updated: 0 });
 
     const data = await brotherAPI({
-      actionType: "mass_status",
-      orderID:    providerIds.join(","),
+      action: "mass_status",           // ✅
+      order:  providerIds.join(","),   // ✅ "order" not "orderID"
     });
 
     let updated = 0;
@@ -630,8 +663,8 @@ app.post("/api/orders/:id/refill", guard, async (req, res) => {
       return res.status(400).json({ message: "No provider order ID" });
 
     const data = await brotherAPI({
-      actionType: "refill",
-      orderID:    order.providerOrderId,
+      action: "refill",               // ✅
+      order:  order.providerOrderId,  // ✅
     });
 
     order.status = "Refill Requested";
@@ -656,8 +689,8 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
       return res.status(400).json({ message: "Order cannot be cancelled" });
 
     const data = await brotherAPI({
-      actionType: "cancel",
-      orderID:    order.providerOrderId,
+      action: "cancel",               // ✅
+      order:  order.providerOrderId,  // ✅
     });
 
     order.status = "Cancelled";
