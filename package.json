@@ -1,7 +1,7 @@
 {
   "name": "smm-panel-backend",
   "version": "1.0.0",
-  "description": "SMM Panel API — Single file backend",
+  "description": "SMM Panel API with Brother SMM integration",
   "main": "web.js",
   "scripts": {
     "start": "node web.js",
@@ -11,6 +11,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "axios":         "^1.6.8",
     "bcryptjs":      "^2.4.3",
     "cors":          "^2.8.5",
     "dotenv":        "^16.3.1",
