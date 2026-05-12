@@ -7,20 +7,23 @@ const mongoose  = require("mongoose");
 const bcrypt    = require("bcryptjs");
 const jwt       = require("jsonwebtoken");
 const axios     = require("axios");
+const qs        = require("querystring"); // Node built-in, no install needed
 
 /* ══════════════════════════════════════════════════════════
    ENVIRONMENT VARIABLES
 ══════════════════════════════════════════════════════════ */
-const PORT             = process.env.PORT             || 5000;
-const MONGODB_URI      = process.env.MONGODB_URI;
-const JWT_SECRET       = process.env.JWT_SECRET       || "change_me_in_production";
-const BROTHER_API_KEY  = process.env.BROTHER_API_KEY  || "";
-const BROTHER_API_URL  = process.env.BROTHER_API_URL  || "https://brothersmm.com/api";
-const MMK_RATE         = parseFloat(process.env.MMK_RATE || "2200"); // 1 USD = MMK_RATE Ks
-const MARKUP           = parseFloat(process.env.MARKUP   || "1.2");  // 20% markup
+const PORT            = process.env.PORT            || 5000;
+const MONGODB_URI     = process.env.MONGODB_URI;
+const JWT_SECRET      = process.env.JWT_SECRET;
+const BROTHER_API_KEY = process.env.BROTHER_API_KEY || "";
+const BROTHER_API_URL = process.env.BROTHER_API_URL || "https://brothersmm.com/api";
+const MMK_RATE        = parseFloat(process.env.MMK_RATE || "2200");
+const MARKUP          = parseFloat(process.env.MARKUP   || "1.2");
 
+/* Validate required env vars at startup */
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
-if (!BROTHER_API_KEY) console.warn("⚠️  BROTHER_API_KEY not set");
+if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
+if (!BROTHER_API_KEY) console.warn("⚠️   BROTHER_API_KEY not set — provider calls will fail");
 
 const app = express();
 
@@ -39,6 +42,7 @@ app.use(cors({
   allowedHeaders: ["Content-Type","Authorization"],
   credentials:    true,
 }));
+
 app.use(express.json());
 
 /* ══════════════════════════════════════════════════════════
@@ -48,9 +52,10 @@ app.use(express.json());
 /* ── User ──────────────────────────────────────────────── */
 const userSchema = new mongoose.Schema({
   name:         { type: String,  required: true, trim: true },
-  email:        { type: String,  required: true, unique: true, lowercase: true, trim: true },
+  email:        { type: String,  required: true, unique: true,
+                  lowercase: true, trim: true },
   password:     { type: String,  required: true },
-  balance:      { type: Number,  default: 0 },      // in MMK (Kyats)
+  balance:      { type: Number,  default: 0 },      // MMK (Kyats)
   balanceSpent: { type: Number,  default: 0 },
   totalOrders:  { type: Number,  default: 0 },
 }, { timestamps: true });
@@ -59,23 +64,21 @@ const User = mongoose.model("User", userSchema);
 
 /* ── Order ─────────────────────────────────────────────── */
 const orderSchema = new mongoose.Schema({
-  user:             { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-  // Provider info
-  providerOrderId:  { type: Number,  default: null },   // Brother SMM orderID
+  user:             { type: mongoose.Schema.Types.ObjectId,
+                      ref: "User", required: true },
+  providerOrderId:  { type: Number,  default: null },
   serviceId:        { type: String,  required: true },
   serviceName:      { type: String,  default: "" },
   category:         { type: String,  default: "" },
-  // Order details
   link:             { type: String,  required: true },
   quantity:         { type: Number,  required: true },
-  chargeMMK:        { type: Number,  required: true },  // charge in Kyats
-  chargeUSD:        { type: Number,  default: 0 },      // approximate USD
-  // Status (synced from provider)
+  chargeMMK:        { type: Number,  required: true },
+  chargeUSD:        { type: Number,  default: 0 },
   status:           { type: String,  default: "Pending" },
   startCount:       { type: String,  default: "0" },
   remains:          { type: Number,  default: 0 },
   refundedAmount:   { type: Number,  default: 0 },
-  providerError:    { type: String,  default: null },   // error if provider rejected
+  providerError:    { type: String,  default: null },
 }, { timestamps: true });
 
 const Order = mongoose.model("Order", orderSchema);
@@ -83,10 +86,9 @@ const Order = mongoose.model("Order", orderSchema);
 /* ══════════════════════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════════════════════ */
-
 const makeToken = (id) => jwt.sign({ id }, JWT_SECRET, { expiresIn: "7d" });
 
-const safeUser  = (u)  => ({
+const safeUser = (u) => ({
   id:           u._id,
   name:         u.name,
   email:        u.email,
@@ -98,34 +100,82 @@ const safeUser  = (u)  => ({
 
 const normEmail = (e) => String(e || "").toLowerCase().trim();
 
-/* ── Auth middleware ──────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════
+   AUTH MIDDLEWARE  (fix: split on space, robust extraction)
+══════════════════════════════════════════════════════════ */
 function guard(req, res, next) {
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Bearer "))
-    return res.status(401).json({ message: "No token provided" });
   try {
-    req.uid = jwt.verify(header.slice(7), JWT_SECRET).id;
+    const authHeader = req.headers["authorization"] || req.headers["Authorization"] || "";
+
+    if (!authHeader || authHeader.trim() === "") {
+      return res.status(401).json({ message: "Authorization header missing" });
+    }
+
+    // Support both "Bearer <token>" and raw token
+    const parts = authHeader.trim().split(/\s+/);
+    const token  = parts.length === 2 && parts[0].toLowerCase() === "bearer"
+      ? parts[1]   // standard: "Bearer eyJ..."
+      : parts[0];  // fallback: raw token sent without "Bearer"
+
+    if (!token) {
+      return res.status(401).json({ message: "Token not provided" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.uid = decoded.id;
     next();
-  } catch {
-    res.status(401).json({ message: "Token invalid or expired" });
+  } catch (err) {
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ message: "Token expired, please log in again" });
+    }
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ message: "Invalid token, please log in again" });
+    }
+    return res.status(401).json({ message: "Authentication failed" });
   }
 }
 
 /* ══════════════════════════════════════════════════════════
    BROTHER SMM API HELPER
-   All calls are POST with JSON body.
+   ─────────────────────────────────────────────────────────
+   Per Brother SMM docs:
+     Method  : POST
+     Content : application/x-www-form-urlencoded  ← KEY FIX
+     apiKey  : your API key
+     actionType: add | services | status | ...
 ══════════════════════════════════════════════════════════ */
 async function brotherAPI(params) {
-  const payload = { apiKey: BROTHER_API_KEY, ...params };
+  const payload = qs.stringify({
+    apiKey: BROTHER_API_KEY,   // parameter name: apiKey
+    ...params,                 // actionType, orderType, etc.
+  });
+
   try {
     const { data } = await axios.post(BROTHER_API_URL, payload, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 15000,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded", // required by docs
+      },
+      timeout: 20000,
     });
+
+    // Brother SMM returns error as { error: "..." } in the JSON body
+    if (data && data.error) {
+      throw new Error(data.error);
+    }
     return data;
+
   } catch (err) {
-    const msg = err.response?.data?.error || err.message || "Provider unreachable";
-    throw new Error("[BrotherSMM] " + msg);
+    if (err.response) {
+      // HTTP error from provider
+      const msg = err.response.data?.error
+        || err.response.data?.message
+        || `Provider HTTP ${err.response.status}`;
+      throw new Error("[BrotherSMM] " + msg);
+    }
+    if (err.request) {
+      throw new Error("[BrotherSMM] No response from provider (timeout or network error)");
+    }
+    throw new Error("[BrotherSMM] " + err.message);
   }
 }
 
@@ -140,6 +190,7 @@ app.post("/api/auth/signup", async (req, res) => {
   try {
     const { name, password } = req.body;
     const email = normEmail(req.body.email);
+
     if (!name || !email || !password)
       return res.status(400).json({ message: "Please fill in all fields" });
     if (password.length < 6)
@@ -149,9 +200,15 @@ app.post("/api/auth/signup", async (req, res) => {
 
     const hash = await bcrypt.hash(password, 12);
     const user = await User.create({ name, email, password: hash });
+
     console.log("[SIGNUP]", email);
-    res.status(201).json({ message: "Account created", token: makeToken(user._id), user: safeUser(user) });
+    res.status(201).json({
+      message: "Account created successfully",
+      token:   makeToken(user._id),
+      user:    safeUser(user),
+    });
   } catch (e) {
+    console.error("[SIGNUP ERR]", e.message);
     res.status(500).json({ message: "Server error: " + e.message });
   }
 });
@@ -161,6 +218,7 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { password } = req.body;
     const input = String(req.body.email || req.body.username || "").trim();
+
     if (!input || !password)
       return res.status(400).json({ message: "Please fill in all fields" });
 
@@ -170,12 +228,18 @@ app.post("/api/auth/login", async (req, res) => {
         { name:  { $regex: `^${input}$`, $options: "i" } },
       ],
     });
+
     if (!user || !(await bcrypt.compare(password, user.password)))
       return res.status(401).json({ message: "Invalid username or password" });
 
     console.log("[LOGIN]", user.email);
-    res.json({ message: "Login successful", token: makeToken(user._id), user: safeUser(user) });
+    res.json({
+      message: "Login successful",
+      token:   makeToken(user._id),
+      user:    safeUser(user),
+    });
   } catch (e) {
+    console.error("[LOGIN ERR]", e.message);
     res.status(500).json({ message: "Server error: " + e.message });
   }
 });
@@ -185,28 +249,36 @@ app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { newPassword } = req.body;
     const email = normEmail(req.body.email);
+
     if (!email || !newPassword)
       return res.status(400).json({ message: "Email and new password are required" });
     if (newPassword.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
 
     const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "No account found with this email" });
+    if (!user)
+      return res.status(404).json({ message: "No account found with this email" });
 
-    await User.updateOne({ email }, { $set: { password: await bcrypt.hash(newPassword, 12) } });
+    await User.updateOne({ email }, {
+      $set: { password: await bcrypt.hash(newPassword, 12) },
+    });
+
+    console.log("[RESET]", email);
     res.json({ message: "Password reset successfully. You can now log in." });
   } catch (e) {
+    console.error("[RESET ERR]", e.message);
     res.status(500).json({ message: "Server error: " + e.message });
   }
 });
 
-/* ME */
+/* ME — current user info */
 app.get("/api/auth/me", guard, async (req, res) => {
   try {
     const user = await User.findById(req.uid).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(safeUser(user));
   } catch (e) {
+    console.error("[ME ERR]", e.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -225,9 +297,14 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
     if (!(await bcrypt.compare(currentPassword, user.password)))
       return res.status(401).json({ message: "Current password is incorrect" });
 
-    await User.updateOne({ _id: req.uid }, { $set: { password: await bcrypt.hash(newPassword, 12) } });
+    await User.updateOne({ _id: req.uid }, {
+      $set: { password: await bcrypt.hash(newPassword, 12) },
+    });
+
+    console.log("[CHPW]", user.email);
     res.json({ message: "Password changed successfully" });
   } catch (e) {
+    console.error("[CHPW ERR]", e.message);
     res.status(500).json({ message: "Server error: " + e.message });
   }
 });
@@ -238,23 +315,69 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
 
 /*
  * GET /api/provider/services
- * Returns full services list from Brother SMM.
- * Cached in memory for 10 minutes to avoid rate-limits.
+ *
+ * Brother SMM returns an Object (key=service_id, value=service details).
+ * We convert it to a sorted Array for the frontend.
+ * Cached 10 minutes to avoid rate-limiting.
  */
-let servicesCache = null;
-let servicesCachedAt = 0;
+let _servicesCache   = null;
+let _servicesCachedAt = 0;
 
 app.get("/api/provider/services", guard, async (req, res) => {
   try {
     const now = Date.now();
-    if (servicesCache && (now - servicesCachedAt) < 10 * 60 * 1000) {
-      return res.json(servicesCache);
+    const forceRefresh = req.query.refresh === "1";
+
+    if (!forceRefresh && _servicesCache && (now - _servicesCachedAt) < 10 * 60 * 1000) {
+      return res.json(_servicesCache);
     }
-    const data = await brotherAPI({ actionType: "services" });
-    servicesCache   = data;
-    servicesCachedAt = now;
-    console.log("[SERVICES] fetched", Object.keys(data).length, "services");
-    res.json(data);
+
+    // Fetch from Brother SMM — actionType: "services"
+    const raw = await brotherAPI({ actionType: "services" });
+
+    /*
+     * Brother SMM response format (Object, NOT Array):
+     * {
+     *   "8":  { service_id:"8", name:"...", category:"Facebook", price:"10", ... },
+     *   "11": { service_id:"11", ... },
+     *   ...
+     * }
+     * Convert to Array sorted by service_id (numeric).
+     */
+    let servicesArray;
+
+    if (Array.isArray(raw)) {
+      // Some panels return an Array directly
+      servicesArray = raw;
+    } else if (typeof raw === "object" && raw !== null) {
+      // Object → Array conversion
+      servicesArray = Object.values(raw).map(svc => ({
+        service_id:  String(svc.service_id || svc.id || ""),
+        name:        svc.name        || "",
+        type:        svc.type        || "default",
+        price:       svc.price       || "0",
+        min_amount:  svc.min_amount  || "10",
+        max_amount:  svc.max_amount  || "10000000",
+        description: svc.description || "",
+        category:    svc.category    || "Other",
+        avg_time:    svc.avg_time    || null,
+      }));
+
+      // Sort numerically by service_id
+      servicesArray.sort((a, b) =>
+        parseInt(a.service_id) - parseInt(b.service_id)
+      );
+    } else {
+      return res.status(502).json({ message: "Unexpected response from provider" });
+    }
+
+    // Cache and return
+    _servicesCache    = servicesArray;
+    _servicesCachedAt = now;
+
+    console.log(`[SERVICES] Fetched ${servicesArray.length} services`);
+    res.json(servicesArray);
+
   } catch (e) {
     console.error("[SERVICES ERR]", e.message);
     res.status(502).json({ message: e.message });
@@ -263,14 +386,14 @@ app.get("/api/provider/services", guard, async (req, res) => {
 
 /*
  * GET /api/provider/balance
- * Returns Brother SMM account balance (USD).
- * Useful for admin to monitor.
+ * Returns Brother SMM USD balance.
  */
 app.get("/api/provider/balance", guard, async (req, res) => {
   try {
     const data = await brotherAPI({ actionType: "balance" });
-    res.json(data);  // { balance, currency }
+    res.json(data);
   } catch (e) {
+    console.error("[BAL ERR]", e.message);
     res.status(502).json({ message: e.message });
   }
 });
@@ -281,25 +404,28 @@ app.get("/api/provider/balance", guard, async (req, res) => {
 
 /*
  * POST /api/orders
- * Place a new order. Deducts user balance, calls Brother SMM, stores in DB.
+ * Place order → deduct balance → call Brother SMM → save to DB.
  *
  * Body: { serviceId, serviceName, category, link, quantity, chargeMMK }
  */
 app.post("/api/orders", guard, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
+
   try {
     const { serviceId, serviceName, category, link, quantity, chargeMMK } = req.body;
 
-    // ── Validate ─────────────────────────────────────────
+    // Validate
     if (!serviceId || !link || !quantity || !chargeMMK)
-      return res.status(400).json({ message: "serviceId, link, quantity, chargeMMK are required" });
+      return res.status(400).json({
+        message: "serviceId, link, quantity, chargeMMK are required",
+      });
     if (quantity < 1)
       return res.status(400).json({ message: "Quantity must be at least 1" });
     if (chargeMMK <= 0)
       return res.status(400).json({ message: "Invalid charge amount" });
 
-    // ── Check user balance ────────────────────────────────
+    // Check user balance
     const user = await User.findById(req.uid).session(session);
     if (!user) return res.status(404).json({ message: "User not found" });
     if (user.balance < chargeMMK)
@@ -307,16 +433,16 @@ app.post("/api/orders", guard, async (req, res) => {
         message: `Insufficient balance. Need ${chargeMMK} Ks, have ${user.balance} Ks`,
       });
 
-    // ── Deduct balance (optimistic — before API call) ─────
+    // Deduct balance
     user.balance      -= chargeMMK;
     user.balanceSpent += chargeMMK;
     user.totalOrders  += 1;
     await user.save({ session });
 
-    // ── Create Order record in DB ─────────────────────────
+    // Create order record
     const chargeUSD = parseFloat((chargeMMK / MMK_RATE).toFixed(4));
     const [order]   = await Order.create([{
-      user:        req.uid,
+      user: req.uid,
       serviceId,
       serviceName: serviceName || "",
       category:    category    || "",
@@ -324,51 +450,34 @@ app.post("/api/orders", guard, async (req, res) => {
       quantity,
       chargeMMK,
       chargeUSD,
-      status:      "Processing",
+      status: "Processing",
     }], { session });
 
-    // ── Call Brother SMM API ──────────────────────────────
+    // Call Brother SMM — actionType: "add"
     let providerRes;
     try {
       providerRes = await brotherAPI({
         actionType:    "add",
-        orderType:     serviceId,
+        orderType:     serviceId,    // Service ID
         orderUrl:      link,
         orderQuantity: quantity,
       });
     } catch (provErr) {
-      // Provider rejected → refund user balance
+      // Refund on provider failure
       user.balance      += chargeMMK;
       user.balanceSpent -= chargeMMK;
       user.totalOrders  -= 1;
       await user.save({ session });
-
       order.status        = "Failed";
       order.providerError = provErr.message;
       await order.save({ session });
-
       await session.commitTransaction();
       session.endSession();
+      console.error("[ORDER] Provider rejected:", provErr.message);
       return res.status(502).json({ message: provErr.message });
     }
 
-    // ── Save provider orderID ─────────────────────────────
-    if (providerRes.error) {
-      // Provider returned an error in the response body
-      user.balance      += chargeMMK;
-      user.balanceSpent -= chargeMMK;
-      user.totalOrders  -= 1;
-      await user.save({ session });
-
-      order.status        = "Failed";
-      order.providerError = providerRes.error;
-      await order.save({ session });
-
-      await session.commitTransaction();
-      session.endSession();
-      return res.status(400).json({ message: "Provider error: " + providerRes.error });
-    }
-
+    // Save provider orderID
     order.providerOrderId = providerRes.orderID;
     order.status          = "Pending";
     await order.save({ session });
@@ -376,7 +485,7 @@ app.post("/api/orders", guard, async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    console.log("[ORDER] created", order._id, "→ provider", providerRes.orderID);
+    console.log(`[ORDER] Created ${order._id} → provider #${providerRes.orderID}`);
     res.status(201).json({
       message:          "Order placed successfully",
       orderId:          order._id,
@@ -385,7 +494,8 @@ app.post("/api/orders", guard, async (req, res) => {
       order: {
         id:          order._id,
         serviceId,
-        serviceName,
+        serviceName: serviceName || "",
+        category:    category    || "",
         link,
         quantity,
         chargeMMK,
@@ -393,6 +503,7 @@ app.post("/api/orders", guard, async (req, res) => {
         createdAt:   order.createdAt,
       },
     });
+
   } catch (e) {
     await session.abortTransaction();
     session.endSession();
@@ -403,13 +514,12 @@ app.post("/api/orders", guard, async (req, res) => {
 
 /*
  * GET /api/orders
- * Returns current user's orders (newest first).
- * Query: ?page=1&limit=20&status=Pending
+ * User's order history. Query: ?page=1&limit=20&status=Pending
  */
 app.get("/api/orders", guard, async (req, res) => {
   try {
-    const page   = Math.max(1, parseInt(req.query.page)  || 1);
-    const limit  = Math.min(50, parseInt(req.query.limit) || 20);
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
     const filter = { user: req.uid };
     if (req.query.status) filter.status = req.query.status;
 
@@ -429,7 +539,6 @@ app.get("/api/orders", guard, async (req, res) => {
 
 /*
  * GET /api/orders/:id
- * Single order detail.
  */
 app.get("/api/orders/:id", guard, async (req, res) => {
   try {
@@ -443,25 +552,24 @@ app.get("/api/orders/:id", guard, async (req, res) => {
 
 /*
  * POST /api/orders/:id/sync-status
- * Fetch latest status from Brother SMM and update DB.
+ * Fetch latest status from Brother SMM (actionType: "status").
  */
 app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, user: req.uid });
     if (!order) return res.status(404).json({ message: "Order not found" });
     if (!order.providerOrderId)
-      return res.status(400).json({ message: "No provider order ID for this order" });
+      return res.status(400).json({ message: "No provider order ID" });
 
     const data = await brotherAPI({
       actionType: "status",
       orderID:    order.providerOrderId,
     });
 
-    // Update local record
-    order.status          = data.orderStatus  || order.status;
-    order.startCount      = data.startCount   || order.startCount;
-    order.remains         = parseFloat(data.remaining_amount) || 0;
-    order.refundedAmount  = parseFloat(data.refunded_amount)  || 0;
+    order.status         = data.orderStatus              || order.status;
+    order.startCount     = data.startCount               || order.startCount;
+    order.remains        = parseFloat(data.remaining_amount || 0);
+    order.refundedAmount = parseFloat(data.refunded_amount  || 0);
     await order.save();
 
     res.json({ message: "Status synced", order, providerData: data });
@@ -473,18 +581,18 @@ app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
 
 /*
  * POST /api/orders/sync-bulk
- * Sync status for up to 100 orders at once.
- * Body: { orderIds: ["dbId1","dbId2",...] }
+ * Mass status check (actionType: "mass_status") — up to 100 orders.
+ * Body: { orderIds: ["dbId1",...] }
  */
 app.post("/api/orders/sync-bulk", guard, async (req, res) => {
   try {
     const { orderIds } = req.body;
-    if (!Array.isArray(orderIds) || orderIds.length === 0)
+    if (!Array.isArray(orderIds) || !orderIds.length)
       return res.status(400).json({ message: "orderIds array required" });
     if (orderIds.length > 100)
-      return res.status(400).json({ message: "Maximum 100 orders per request" });
+      return res.status(400).json({ message: "Max 100 orders per request" });
 
-    const orders = await Order.find({ _id: { $in: orderIds }, user: req.uid });
+    const orders      = await Order.find({ _id: { $in: orderIds }, user: req.uid });
     const providerIds = orders.map(o => o.providerOrderId).filter(Boolean);
     if (!providerIds.length)
       return res.json({ message: "No provider IDs found", updated: 0 });
@@ -498,14 +606,13 @@ app.post("/api/orders/sync-bulk", guard, async (req, res) => {
     for (const order of orders) {
       const d = data[order.providerOrderId];
       if (!d) continue;
-      order.status         = d.orderStatus          || order.status;
-      order.startCount     = d.startCount           || order.startCount;
-      order.remains        = parseFloat(d.remaining_amount) || 0;
-      order.refundedAmount = parseFloat(d.refunded_amount)  || 0;
+      order.status         = d.orderStatus              || order.status;
+      order.startCount     = d.startCount               || order.startCount;
+      order.remains        = parseFloat(d.remaining_amount || 0);
+      order.refundedAmount = parseFloat(d.refunded_amount  || 0);
       await order.save();
       updated++;
     }
-
     res.json({ message: `${updated} orders updated`, updated });
   } catch (e) {
     res.status(502).json({ message: e.message });
@@ -513,8 +620,7 @@ app.post("/api/orders/sync-bulk", guard, async (req, res) => {
 });
 
 /*
- * POST /api/orders/:id/refill
- * Request a refill from Brother SMM.
+ * POST /api/orders/:id/refill  (actionType: "refill")
  */
 app.post("/api/orders/:id/refill", guard, async (req, res) => {
   try {
@@ -530,7 +636,6 @@ app.post("/api/orders/:id/refill", guard, async (req, res) => {
 
     order.status = "Refill Requested";
     await order.save();
-
     res.json({ message: data.message || "Refill requested", providerResponse: data });
   } catch (e) {
     res.status(502).json({ message: e.message });
@@ -538,8 +643,8 @@ app.post("/api/orders/:id/refill", guard, async (req, res) => {
 });
 
 /*
- * POST /api/orders/:id/cancel
- * Cancel order and request refund from provider.
+ * POST /api/orders/:id/cancel  (actionType: "cancel")
+ * Auto-refund proportional to remaining quantity.
  */
 app.post("/api/orders/:id/cancel", guard, async (req, res) => {
   try {
@@ -559,21 +664,22 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
     await order.save();
 
     // Partial refund if remains > 0
-    if (order.remains > 0) {
-      const refundRatio = order.remains / order.quantity;
-      const refundMMK   = Math.floor(order.chargeMMK * refundRatio);
+    let refundMMK = 0;
+    if (order.remains > 0 && order.quantity > 0) {
+      const ratio   = order.remains / order.quantity;
+      refundMMK     = Math.floor(order.chargeMMK * ratio);
       if (refundMMK > 0) {
         await User.findByIdAndUpdate(req.uid, {
           $inc: { balance: refundMMK, balanceSpent: -refundMMK },
         });
-        return res.json({
-          message:      data.message || "Order cancelled",
-          refundMMK,
-          providerResponse: data,
-        });
       }
     }
-    res.json({ message: data.message || "Order cancelled", providerResponse: data });
+
+    res.json({
+      message:          data.message || "Order cancelled",
+      refundMMK,
+      providerResponse: data,
+    });
   } catch (e) {
     res.status(502).json({ message: e.message });
   }
@@ -590,7 +696,9 @@ app.use((_, res) => res.status(404).json({ message: "Route not found" }));
 mongoose.connect(MONGODB_URI)
   .then(() => {
     console.log("✅  MongoDB connected");
-    app.listen(PORT, () => console.log(`🚀  Server running on port ${PORT}`));
+    app.listen(PORT, () =>
+      console.log(`🚀  Server running on port ${PORT}`)
+    );
   })
   .catch(e => {
     console.error("❌  MongoDB:", e.message);
