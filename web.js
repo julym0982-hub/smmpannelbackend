@@ -16,7 +16,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET  = process.env.JWT_SECRET;
 const JAP_API_KEY = process.env.JAP_API_KEY || "";
 const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
-const MMK_RATE    = parseFloat(process.env.MMK_RATE || "2200");
+const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
 const MARKUP      = parseFloat(process.env.MARKUP   || "1.2");
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
@@ -115,8 +115,9 @@ async function japAPI(params, _retry = false) {
     payload.append("service",  String(params.service));
     payload.append("link",     String(params.link));
     payload.append("quantity", String(params.quantity));
-    if (params.runs)     payload.append("runs",     String(params.runs));
-    if (params.interval) payload.append("interval", String(params.interval));
+    if (params.runs)      payload.append("runs",      String(params.runs));
+    if (params.interval)  payload.append("interval",  String(params.interval));
+    if (params.comments)  payload.append("comments",  String(params.comments)); // Custom Comments
   }
 
   // Single order operations (status / refill)
@@ -333,7 +334,7 @@ app.post("/api/orders", guard, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { serviceId, serviceName, category, link, quantity, chargeMMK } = req.body;
+    const { serviceId, serviceName, category, link, quantity, chargeMMK, comments } = req.body;
     if (!serviceId || !link || !quantity || !chargeMMK)
       return res.status(400).json({ message: "serviceId, link, quantity, chargeMMK required" });
 
@@ -355,12 +356,15 @@ app.post("/api/orders", guard, async (req, res) => {
     // ── Call JAP API ──────────────────────────────────────
     let providerRes;
     try {
-      providerRes = await japAPI({
+      // Build JAP add payload — include comments if present (Custom Comments type)
+      const japPayload = {
         action:   "add",
-        service:  serviceId,   // JAP: service
+        service:  serviceId,
         link:     link,
         quantity: quantity,
-      });
+      };
+      if (comments) japPayload.comments = comments;
+      providerRes = await japAPI(japPayload);
     } catch (provErr) {
       // Refund on failure
       user.balance += chargeMMK; user.balanceSpent -= chargeMMK; user.totalOrders -= 1;
