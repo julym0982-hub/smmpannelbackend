@@ -7,17 +7,6 @@ const mongoose  = require("mongoose");
 const bcrypt    = require("bcryptjs");
 const jwt       = require("jsonwebtoken");
 const axios     = require("axios");
-const multer    = require("multer");
-
-/* multer — memory storage (no disk needed on Render/Vercel) */
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },   // 5 MB max
-  fileFilter: (_, file, cb) => {
-    if (file.mimetype.startsWith("image/")) cb(null, true);
-    else cb(new Error("Only image files are allowed"));
-  },
-});
 
 /* ══════════════════════════════════════════════════════════
    ENV VARS
@@ -25,19 +14,14 @@ const upload = multer({
 const PORT        = process.env.PORT        || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET  = process.env.JWT_SECRET;
-const JAP_API_KEY   = process.env.JAP_API_KEY   || "";
-const JAP_API_URL   = process.env.JAP_API_URL   || "https://justanotherpanel.com/api/v2";
-const MMK_RATE      = parseFloat(process.env.MMK_RATE || "4500");
-const MARKUP        = parseFloat(process.env.MARKUP   || "1.2");
-const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
-// Comma-separated admin emails: admin@example.com,admin2@example.com
-const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "").split(",")
-  .map(e => e.trim().toLowerCase()).filter(Boolean);
+const JAP_API_KEY = process.env.JAP_API_KEY || "";
+const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
+const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
+const MARKUP      = parseFloat(process.env.MARKUP   || "1.2");
 
-if (!MONGODB_URI)    { console.error("❌  MONGODB_URI missing"); process.exit(1); }
-if (!JWT_SECRET)     { console.error("❌  JWT_SECRET missing");  process.exit(1); }
-if (!JAP_API_KEY)     console.warn("⚠️  JAP_API_KEY not set");
-if (!IMGBB_API_KEY)   console.warn("⚠️  IMGBB_API_KEY not set — deposits won't work");
+if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
+if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
+if (!JAP_API_KEY)  console.warn("⚠️  JAP_API_KEY not set — provider calls will fail");
 
 const app = express();
 
@@ -62,7 +46,6 @@ const userSchema = new mongoose.Schema({
   balance:      { type: Number, default: 0 },
   balanceSpent: { type: Number, default: 0 },
   totalOrders:  { type: Number, default: 0 },
-  isAdmin:      { type: Boolean, default: false },
 }, { timestamps: true });
 const User = mongoose.model("User", userSchema);
 
@@ -83,21 +66,6 @@ const orderSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Order = mongoose.model("Order", orderSchema);
 
-/* ── PaymentRequest (Deposit) ─────────────────────────── */
-const paymentSchema = new mongoose.Schema({
-  user:          { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-  username:      { type: String,  default: "" },
-  email:         { type: String,  default: "" },
-  amount:        { type: Number,  required: true },
-  creditAmount:  { type: Number,  default: 0 },
-  screenshotUrl: { type: String,  required: true },
-  status:        { type: String,  enum: ["pending","approved","rejected"], default: "pending" },
-  note:          { type: String,  default: "" },
-  approvedBy:    { type: String,  default: "" },
-}, { timestamps: true });
-const PaymentRequest = mongoose.model("PaymentRequest", paymentSchema);
-
-
 /* ══════════════════════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════════════════════ */
@@ -107,7 +75,6 @@ const safeUser = (u) => ({
   id: u._id, name: u.name, email: u.email,
   balance: u.balance, balanceSpent: u.balanceSpent,
   totalOrders: u.totalOrders, createdAt: u.createdAt,
-  isAdmin: u.isAdmin || false,
 });
 
 const normEmail = (e) => String(e || "").toLowerCase().trim();
@@ -127,44 +94,6 @@ function guard(req, res, next) {
       return res.status(401).json({ message: "Token expired, please log in again" });
     return res.status(401).json({ message: "Invalid token, please log in again" });
   }
-}
-
-/* ── Admin guard ────────────────────────────────────────────*/
-async function adminGuard(req, res, next) {
-  try {
-    const authHeader = req.headers["authorization"] || "";
-    if (!authHeader) return res.status(401).json({ message: "Authorization header missing" });
-    const parts = authHeader.trim().split(/\s+/);
-    const token = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : parts[0];
-    if (!token) return res.status(401).json({ message: "Token not provided" });
-    req.uid = jwt.verify(token, JWT_SECRET).id;
-    const user = await User.findById(req.uid);
-    if (!user) return res.status(404).json({ message: "User not found" });
-    const isAdmin = user.isAdmin || ADMIN_EMAILS.includes(user.email.toLowerCase());
-    if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
-    req.adminUser = user;
-    next();
-  } catch (err) {
-    if (err.name === "TokenExpiredError")
-      return res.status(401).json({ message: "Token expired" });
-    return res.status(401).json({ message: "Invalid token" });
-  }
-}
-
-/* ── ImgBB upload ────────────────────────────────────────────
-   Uploads buffer to ImgBB, returns public image URL           */
-async function uploadToImgBB(buffer) {
-  if (!IMGBB_API_KEY) throw new Error("IMGBB_API_KEY not configured on server");
-  const base64 = buffer.toString("base64");
-  const params = new URLSearchParams();
-  params.append("key",   IMGBB_API_KEY);
-  params.append("image", base64);
-  const { data } = await axios.post("https://api.imgbb.com/1/upload", params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 30000,
-  });
-  if (!data.success) throw new Error("ImgBB upload failed: " + JSON.stringify(data.error || data));
-  return data.data.url;  // direct image URL
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -606,83 +535,6 @@ app.use((_, res) => res.status(404).json({ message: "Route not found" }));
 /* ══════════════════════════════════════════════════════════
    START
 ══════════════════════════════════════════════════════════ */
-
-/* ══════════════════════════════════════════════════════════
-   ROUTES — DEPOSIT (User)
-══════════════════════════════════════════════════════════ */
-app.post("/api/deposit/request", guard, upload.single("screenshot"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message: "Screenshot is required" });
-    const amount = parseInt(req.body.amount);
-    if (!amount || amount < 1000)
-      return res.status(400).json({ message: "Minimum deposit amount is 1,000 Ks" });
-    const screenshotUrl = await uploadToImgBB(req.file.buffer);
-    const user = await User.findById(req.uid);
-    const payment = await PaymentRequest.create({
-      user: req.uid, username: user.name, email: user.email,
-      amount, screenshotUrl, status: "pending",
-    });
-    console.log("[DEPOSIT] Created:", payment._id, "by", user.email);
-    res.status(201).json({
-      message: "Deposit request submitted! Admin will review and approve shortly.",
-      requestId: payment._id,
-    });
-  } catch (e) { console.error("[DEPOSIT ERR]", e.message); res.status(500).json({ message: e.message }); }
-});
-
-app.get("/api/deposit/history", guard, async (req, res) => {
-  try {
-    const list = await PaymentRequest.find({ user: req.uid }).sort({ createdAt: -1 }).limit(20);
-    res.json(list);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-/* ══════════════════════════════════════════════════════════
-   ROUTES — ADMIN
-══════════════════════════════════════════════════════════ */
-app.get("/api/admin/me", adminGuard, async (req, res) => {
-  res.json({ isAdmin: true, email: req.adminUser.email });
-});
-
-app.get("/api/admin/deposits", adminGuard, async (req, res) => {
-  try {
-    const status = req.query.status || "pending";
-    const list = await PaymentRequest.find({ status })
-      .populate("user", "name email balance")
-      .sort({ createdAt: -1 });
-    res.json(list);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post("/api/admin/deposits/:id/approve", adminGuard, async (req, res) => {
-  try {
-    const creditAmount = parseInt(req.body.creditAmount);
-    if (!creditAmount || creditAmount < 1)
-      return res.status(400).json({ message: "creditAmount must be >= 1 Ks" });
-    const payment = await PaymentRequest.findById(req.params.id).populate("user");
-    if (!payment) return res.status(404).json({ message: "Request not found" });
-    if (payment.status !== "pending") return res.status(400).json({ message: "Already processed" });
-    const updatedUser = await User.findByIdAndUpdate(
-      payment.user._id, { $inc: { balance: creditAmount } }, { new: true });
-    payment.status = "approved"; payment.creditAmount = creditAmount;
-    payment.approvedBy = req.adminUser.email;
-    await payment.save();
-    res.json({ message: `Approved! ${creditAmount.toLocaleString()} Ks added to ${payment.username}`, newBalance: updatedUser.balance });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post("/api/admin/deposits/:id/reject", adminGuard, async (req, res) => {
-  try {
-    const payment = await PaymentRequest.findById(req.params.id);
-    if (!payment) return res.status(404).json({ message: "Request not found" });
-    if (payment.status !== "pending") return res.status(400).json({ message: "Already processed" });
-    payment.status = "rejected"; payment.note = req.body.note || "Rejected by admin";
-    payment.approvedBy = req.adminUser.email;
-    await payment.save();
-    res.json({ message: "Deposit request rejected" });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
 mongoose.connect(MONGODB_URI)
   .then(() => {
     console.log("✅  MongoDB connected");
