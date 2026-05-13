@@ -352,15 +352,17 @@ app.get("/api/provider/services", guard, async (req, res) => {
 
     // JAP always returns Array — normalize to consistent shape
     const arr = (Array.isArray(raw) ? raw : Object.values(raw)).map(s => ({
-      service_id:  String(s.service || s.service_id || ""),  // unified ID field
-      name:        s.name        || "",
-      type:        s.type        || "Default",
-      category:    s.category    || "Other",
-      rate:        s.rate        || "0",        // USD per 1000 (JAP uses "rate")
-      min:         String(s.min  || "10"),      // JAP: min (not min_amount)
-      max:         String(s.max  || "10000000"),// JAP: max (not max_amount)
-      refill:      s.refill      || false,
-      cancel:      s.cancel      || false,
+      service_id:   String(s.service || s.service_id || ""),
+      name:         s.name          || "",
+      type:         s.type          || "Default",
+      category:     s.category      || "Other",
+      rate:         s.rate          || "0",
+      min:          String(s.min    || "10"),
+      max:          String(s.max    || "10000000"),
+      refill:       s.refill        || false,
+      cancel:       s.cancel        || false,
+      // average_time — JAP may return this field; pass through if present
+      average_time: s.average_time  || s.avg_time || null,
     }));
 
     arr.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
