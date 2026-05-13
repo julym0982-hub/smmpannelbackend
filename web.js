@@ -7,6 +7,14 @@ const mongoose  = require("mongoose");
 const bcrypt    = require("bcryptjs");
 const jwt       = require("jsonwebtoken");
 const axios     = require("axios");
+const multer    = require("multer");
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_, file, cb) =>
+    file.mimetype.startsWith("image/") ? cb(null, true) : cb(new Error("Images only")),
+});
 
 /* ══════════════════════════════════════════════════════════
    ENV VARS
@@ -14,14 +22,18 @@ const axios     = require("axios");
 const PORT        = process.env.PORT        || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET  = process.env.JWT_SECRET;
-const JAP_API_KEY = process.env.JAP_API_KEY || "";
+const JAP_API_KEY   = process.env.JAP_API_KEY   || "";
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
+const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "")
+  .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
 const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
 const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
 const MARKUP      = parseFloat(process.env.MARKUP   || "1.2");
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
-if (!JAP_API_KEY)  console.warn("⚠️  JAP_API_KEY not set — provider calls will fail");
+if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
+if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
 
@@ -46,8 +58,22 @@ const userSchema = new mongoose.Schema({
   balance:      { type: Number, default: 0 },
   balanceSpent: { type: Number, default: 0 },
   totalOrders:  { type: Number, default: 0 },
+  isAdmin:      { type: Boolean, default: false },
 }, { timestamps: true });
 const User = mongoose.model("User", userSchema);
+
+/* ── FundRequest (Deposit) ────────────────────────────────── */
+const fundRequestSchema = new mongoose.Schema({
+  userId:        { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  transactionId: { type: String, required: true, trim: true },
+  screenshotUrl: { type: String, required: true },
+  amount:        { type: Number, default: 0 },       // user-specified or admin-set
+  status:        { type: String,
+                   enum: ["Pending","Approved","Rejected"],
+                   default: "Pending" },
+  adminNotes:    { type: String, default: "" },
+}, { timestamps: true });
+const FundRequest = mongoose.model("FundRequest", fundRequestSchema);
 
 const orderSchema = new mongoose.Schema({
   user:            { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -75,6 +101,7 @@ const safeUser = (u) => ({
   id: u._id, name: u.name, email: u.email,
   balance: u.balance, balanceSpent: u.balanceSpent,
   totalOrders: u.totalOrders, createdAt: u.createdAt,
+  isAdmin: !!(u.isAdmin || ADMIN_EMAILS.includes((u.email||"").toLowerCase())),
 });
 
 const normEmail = (e) => String(e || "").toLowerCase().trim();
@@ -94,6 +121,40 @@ function guard(req, res, next) {
       return res.status(401).json({ message: "Token expired, please log in again" });
     return res.status(401).json({ message: "Invalid token, please log in again" });
   }
+}
+
+
+/* ── Admin guard ──────────────────────────────────────────*/
+async function adminGuard(req, res, next) {
+  try {
+    const h = req.headers["authorization"] || "";
+    const parts = h.trim().split(/\s+/);
+    const token = parts.length === 2 && parts[0].toLowerCase() === "bearer" ? parts[1] : parts[0];
+    if (!token) return res.status(401).json({ message: "No token" });
+    req.uid = jwt.verify(token, JWT_SECRET).id;
+    const user = await User.findById(req.uid);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const isAdmin = user.isAdmin || ADMIN_EMAILS.includes(user.email.toLowerCase());
+    if (!isAdmin) return res.status(403).json({ message: "Admin access required" });
+    req.adminUser = user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+}
+
+/* ── ImgBB upload (free image hosting, no disk needed) ────*/
+async function uploadToImgBB(buffer) {
+  if (!IMGBB_API_KEY) throw new Error("IMGBB_API_KEY not set on server");
+  const params = new URLSearchParams();
+  params.append("key",   IMGBB_API_KEY);
+  params.append("image", buffer.toString("base64"));
+  const { data } = await axios.post("https://api.imgbb.com/1/upload", params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 30000,
+  });
+  if (!data.success) throw new Error("ImgBB upload failed: " + JSON.stringify(data));
+  return data.data.url;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -525,6 +586,156 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
     }
     res.json({ message: "Order canceled", refundMMK, providerResponse: data });
   } catch (e) { res.status(502).json({ message: e.message }); }
+});
+
+
+/* ══════════════════════════════════════════════════════════
+   ROUTES — FUND REQUESTS (User)
+══════════════════════════════════════════════════════════ */
+
+/* POST /api/funds/request  — user submits deposit */
+app.post("/api/funds/request", guard, upload.single("screenshot"), async (req, res) => {
+  try {
+    if (!req.file)
+      return res.status(400).json({ message: "Screenshot is required" });
+    const { transactionId, amount } = req.body;
+    if (!transactionId || transactionId.trim().length < 4)
+      return res.status(400).json({ message: "Transaction ID is required (min 4 chars)" });
+
+    const screenshotUrl = await uploadToImgBB(req.file.buffer);
+    const user = await User.findById(req.uid);
+
+    const fundReq = await FundRequest.create({
+      userId:        req.uid,
+      transactionId: transactionId.trim(),
+      screenshotUrl,
+      amount:        amount ? parseInt(amount) : 0,
+      status:        "Pending",
+    });
+
+    console.log(`[FUND] Request ${fundReq._id} by ${user.email} txn:${transactionId}`);
+    res.status(201).json({
+      message:   "Fund request submitted! Admin will review and approve shortly.",
+      requestId: fundReq._id,
+    });
+  } catch (e) {
+    console.error("[FUND ERR]", e.message);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+/* GET /api/funds/history  — user's own deposit history */
+app.get("/api/funds/history", guard, async (req, res) => {
+  try {
+    const list = await FundRequest.find({ userId: req.uid })
+      .sort({ createdAt: -1 }).limit(20);
+    res.json(list);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* ══════════════════════════════════════════════════════════
+   ROUTES — ADMIN
+══════════════════════════════════════════════════════════ */
+
+/* GET /api/admin/me  — verify admin token */
+app.get("/api/admin/me", adminGuard, (req, res) => {
+  res.json({ isAdmin: true, email: req.adminUser.email, name: req.adminUser.name });
+});
+
+/* GET /api/admin/fund-requests?status=Pending */
+app.get("/api/admin/fund-requests", adminGuard, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.status) filter.status = req.query.status;
+    const list = await FundRequest.find(filter)
+      .populate("userId", "name email balance isAdmin")
+      .sort({ createdAt: -1 });
+    res.json(list);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* POST /api/admin/fund-requests/:id/approve */
+app.post("/api/admin/fund-requests/:id/approve", adminGuard, async (req, res) => {
+  try {
+    const { amount, adminNotes } = req.body;
+    const creditAmount = parseInt(amount);
+    if (!creditAmount || creditAmount < 1)
+      return res.status(400).json({ message: "amount (Ks) is required" });
+
+    const fundReq = await FundRequest.findById(req.params.id).populate("userId");
+    if (!fundReq)                    return res.status(404).json({ message: "Request not found" });
+    if (fundReq.status !== "Pending")
+      return res.status(400).json({ message: "Request already processed" });
+
+    const updatedUser = await User.findByIdAndUpdate(
+      fundReq.userId._id,
+      { $inc: { balance: creditAmount } },
+      { new: true }
+    );
+
+    fundReq.status     = "Approved";
+    fundReq.amount     = creditAmount;
+    fundReq.adminNotes = adminNotes || "";
+    await fundReq.save();
+
+    console.log(`[ADMIN] Approved ${creditAmount} Ks → ${fundReq.userId.email}`);
+    res.json({
+      message:    `Approved! ${creditAmount.toLocaleString()} Ks added to ${fundReq.userId.name}`,
+      newBalance: updatedUser.balance,
+    });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* POST /api/admin/fund-requests/:id/reject */
+app.post("/api/admin/fund-requests/:id/reject", adminGuard, async (req, res) => {
+  try {
+    const fundReq = await FundRequest.findById(req.params.id);
+    if (!fundReq)                    return res.status(404).json({ message: "Request not found" });
+    if (fundReq.status !== "Pending")
+      return res.status(400).json({ message: "Request already processed" });
+
+    fundReq.status     = "Rejected";
+    fundReq.adminNotes = req.body.adminNotes || "Rejected by admin";
+    await fundReq.save();
+
+    console.log(`[ADMIN] Rejected fund request ${fundReq._id}`);
+    res.json({ message: "Request rejected" });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* GET /api/admin/users */
+app.get("/api/admin/users", adminGuard, async (req, res) => {
+  try {
+    const users = await User.find({})
+      .select("-password")
+      .sort({ createdAt: -1 });
+    res.json(users);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* GET /api/admin/users/:id  — user detail + their fund requests */
+app.get("/api/admin/users/:id", adminGuard, async (req, res) => {
+  try {
+    const user      = await User.findById(req.params.id).select("-password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const fundReqs  = await FundRequest.find({ userId: req.params.id })
+      .sort({ createdAt: -1 }).limit(20);
+    const orders    = await Order.find({ user: req.params.id })
+      .sort({ createdAt: -1 }).limit(20);
+    res.json({ user, fundRequests: fundReqs, orders });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+/* PATCH /api/admin/users/:id/balance  — manual balance adjustment */
+app.patch("/api/admin/users/:id/balance", adminGuard, async (req, res) => {
+  try {
+    const { balance } = req.body;
+    if (typeof balance !== "number" || balance < 0)
+      return res.status(400).json({ message: "Valid balance required" });
+    const user = await User.findByIdAndUpdate(req.params.id, { balance }, { new: true });
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json({ message: "Balance updated", balance: user.balance });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 /* ══════════════════════════════════════════════════════════
