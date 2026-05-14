@@ -58,15 +58,39 @@ app.set('trust proxy', 1);
 const mailer = nodemailer.createTransport({
   service: "gmail",
   auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+  tls: { rejectUnauthorized: false },   // avoid cert issues on Render
 });
 
-async function sendMail({ to, subject, html }) {
-  const info = await mailer.sendMail({
-    from:    `"TheNetSMM" <${EMAIL_USER}>`,
-    to, subject, html,
+/* Verify SMTP connection on startup */
+if (EMAIL_USER && EMAIL_PASS) {
+  mailer.verify((err) => {
+    if (err) {
+      console.error("❌ [MAIL] SMTP connection FAILED:", err.message);
+      console.error("   → Check EMAIL_USER and EMAIL_PASS in Render ENV");
+    } else {
+      console.log("✅ [MAIL] SMTP ready — Gmail connected as:", EMAIL_USER);
+    }
   });
-  console.log(`[MAIL] Sent to ${to}: ${info.messageId}`);
-  return info;
+} else {
+  console.warn("⚠️  [MAIL] EMAIL_USER or EMAIL_PASS is empty — emails disabled");
+}
+
+async function sendMail({ to, subject, html }) {
+  if (!EMAIL_USER || !EMAIL_PASS) {
+    console.error("[MAIL] Cannot send — EMAIL_USER/EMAIL_PASS not set in ENV");
+    throw new Error("Email service not configured. Contact admin.");
+  }
+  try {
+    const info = await mailer.sendMail({
+      from:    `"TheNetSMM" <${EMAIL_USER}>`,
+      to, subject, html,
+    });
+    console.log(`✅ [MAIL] Sent → ${to} | id: ${info.messageId}`);
+    return info;
+  } catch (err) {
+    console.error(`❌ [MAIL] Failed to send to ${to}:`, err.message);
+    throw err;
+  }
 }
 
 /* ── Email templates ──────────────────────────────────── */
@@ -602,7 +626,10 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
       console.log(`[FORGOT] Reset email sent to ${email}`);
     } catch (mailErr) {
       console.error("[FORGOT] Email failed:", mailErr.message);
-      return res.status(500).json({ message: "Could not send reset email. Please try again." });
+      console.error("[FORGOT] EMAIL_USER:", EMAIL_USER || "(not set)");
+      return res.status(500).json({
+        message: "Could not send reset email: " + mailErr.message + ". Check server EMAIL configuration.",
+      });
     }
 
     res.json({ message: genericMsg });
