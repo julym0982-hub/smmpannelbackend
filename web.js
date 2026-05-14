@@ -87,6 +87,33 @@ async function sendMail({ to, subject, html }) {
 }
 
 /* ── Email templates ──────────────────────────────────── */
+/* ── Email templates ──────────────────────────────────────*/
+function tplVerify(link) {
+  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
+    <h2 style="color:#5B1AB0">TheNetSMM</h2>
+    <p>Hello,</p>
+    <p>Thank you for registering an account with thenetsmm.com. To complete your registration and verify your email address, please click the button below:</p>
+    <p style="text-align:center;margin:30px 0">
+      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Confirm Account</a>
+    </p>
+    <p>If you did not create an account, you can safely ignore this email.</p>
+    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
+  </div>`;
+}
+
+function tplReset(link) {
+  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
+    <h2 style="color:#5B1AB0">TheNetSMM</h2>
+    <p>Hello,</p>
+    <p>You requested a password change. To proceed, click the button below:</p>
+    <p style="text-align:center;margin:30px 0">
+      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Reset Password</a>
+    </p>
+    <p>If you did not request it, you can safely ignore this message. Only a person with access to your email, can reset your password.</p>
+    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
+  </div>`;
+}
+
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
 ══════════════════════════════════════════════════════════ */
