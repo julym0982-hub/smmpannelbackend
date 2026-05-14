@@ -47,6 +47,11 @@ if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload
 
 const app = express();
 
+/* ── Trust proxy (required for Render / Heroku / Vercel) ──
+   Without this, express-rate-limit throws ValidationError
+   when X-Forwarded-For header is present from the proxy.  */
+app.set('trust proxy', 1);
+
 /* ══════════════════════════════════════════════════════════
    NODEMAILER — Gmail transporter
 ══════════════════════════════════════════════════════════ */
