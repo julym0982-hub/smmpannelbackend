@@ -69,9 +69,13 @@ async function sendMail({ to, subject, html }) {
     throw new Error("Email service not configured. Contact admin.");
   }
   try {
-    const from = EMAIL_USER
-      ? `TheNetSMM <${EMAIL_USER}>`
-      : "TheNetSMM <onboarding@resend.dev>";  // Resend test address
+    // Use verified Resend test address by default.
+    // To use custom domain: verify it at resend.com/domains
+    // then set EMAIL_FROM=noreply@yourdomain.com in ENV
+    const EMAIL_FROM = process.env.EMAIL_FROM || "";
+    const from = EMAIL_FROM
+      ? `TheNetSMM <${EMAIL_FROM}>`
+      : "TheNetSMM <onboarding@resend.dev>";
 
     const { data, error } = await resend.emails.send({ from, to, subject, html });
     if (error) {
