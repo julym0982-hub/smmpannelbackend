@@ -561,33 +561,186 @@ app.post("/api/orders/:id/refill", guard, async (req, res) => {
 });
 
 /*
- * POST /api/orders/:id/cancel
- * JAP: action=cancel, orders=id1,id2  (plural "orders")
- * Response: [{ order: 9, cancel: { error: "..." } }, { order: 2, cancel: 1 }]
+ * POST /api/orders/:id/sync-status   ← Refresh order status from JAP
+ * ─────────────────────────────────────────────────────────
+ * JAP status response:
+ *   { charge, start_count, status, remains, currency }
  */
-app.post("/api/orders/:id/cancel", guard, async (req, res) => {
+app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
   try {
     const order = await Order.findOne({ _id: req.params.id, user: req.uid });
-    if (!order) return res.status(404).json({ message: "Order not found" });
-    if (!order.providerOrderId) return res.status(400).json({ message: "No provider order ID" });
-    if (["Completed","Canceled","Cancelled"].includes(order.status))
-      return res.status(400).json({ message: "Order cannot be cancelled" });
+    if (!order)               return res.status(404).json({ message: "Order not found" });
+    if (!order.providerOrderId) return res.status(400).json({ message: "No provider order ID — cannot sync" });
 
-    // JAP cancel uses "orders" (plural) even for single
-    const data = await japAPI({ action: "cancel", orders: String(order.providerOrderId) });
+    console.log(`[SYNC] Order ${order._id} → JAP #${order.providerOrderId}`);
+    const data = await japAPI({ action: "status", order: order.providerOrderId });
 
-    order.status = "Canceled";  // JAP uses "Canceled" (single l)
+    // Map JAP fields → DB fields
+    order.status     = data.status      || order.status;
+    order.startCount = data.start_count || order.startCount;
+    order.remains    = parseFloat(data.remains || 0);
     await order.save();
 
-    // Partial refund if remains > 0
-    let refundMMK = 0;
-    if (order.remains > 0 && order.quantity > 0) {
-      refundMMK = Math.floor(order.chargeMMK * (order.remains / order.quantity));
-      if (refundMMK > 0)
-        await User.findByIdAndUpdate(req.uid, { $inc: { balance: refundMMK, balanceSpent: -refundMMK } });
+    console.log(`[SYNC] Updated: status=${order.status} remains=${order.remains}`);
+    res.json({
+      message: "Status synced from JAP",
+      order,
+      providerData: {
+        status:      data.status,
+        start_count: data.start_count,
+        remains:     data.remains,
+        charge:      data.charge,
+        currency:    data.currency,
+      },
+    });
+  } catch (e) {
+    console.error("[SYNC ERR]", e.message);
+    res.status(502).json({ message: "Sync failed: " + e.message });
+  }
+});
+
+/*
+ * POST /api/orders/:id/cancel
+ * ─────────────────────────────────────────────────────────
+ * Flow:
+ *   1. Find order & validate ownership / status
+ *   2. Sync latest status from JAP (get fresh remains)
+ *   3. Call JAP cancel API
+ *   4. Parse JAP response — cancel:1 = success, cancel.error = failure
+ *   5. Only on success: update DB + calculate refund
+ *
+ * JAP cancel response (array):
+ *   [{ order: 2, cancel: 1 }]          ← success
+ *   [{ order: 9, cancel: {error:"..."}} ← failure
+ */
+app.post("/api/orders/:id/cancel", guard, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    // ── 1. Find & validate ───────────────────────────────
+    const order = await Order.findOne({ _id: req.params.id, user: req.uid }).session(session);
+    if (!order)
+      return res.status(404).json({ message: "Order not found" });
+    if (!order.providerOrderId)
+      return res.status(400).json({ message: "This order has no provider ID — cannot cancel" });
+    if (["Completed", "Canceled", "Cancelled"].includes(order.status)) {
+      await session.abortTransaction(); session.endSession();
+      return res.status(400).json({ message: `Order is already ${order.status} — cannot cancel` });
     }
-    res.json({ message: "Order canceled", refundMMK, providerResponse: data });
-  } catch (e) { res.status(502).json({ message: e.message }); }
+
+    // ── 2. Sync latest remains from JAP before canceling ──
+    let freshRemains = order.remains;
+    try {
+      const syncData = await japAPI({ action: "status", order: order.providerOrderId });
+      freshRemains   = parseFloat(syncData.remains || 0);
+      order.remains  = freshRemains;
+      order.status   = syncData.status || order.status;
+      console.log(`[CANCEL] Pre-cancel sync: status=${syncData.status} remains=${freshRemains}`);
+    } catch (syncErr) {
+      console.warn("[CANCEL] Pre-cancel sync failed (continuing anyway):", syncErr.message);
+    }
+
+    // ── 3. Call JAP cancel API ───────────────────────────
+    console.log(`[CANCEL] Calling JAP cancel for order #${order.providerOrderId}`);
+    const japResponse = await japAPI({
+      action: "cancel",
+      orders: String(order.providerOrderId),   // JAP uses "orders" (plural) even for single
+    });
+    console.log("[CANCEL] JAP response:", JSON.stringify(japResponse));
+
+    // ── 4. Parse JAP cancel response ────────────────────
+    // JAP returns: [{ order: <id>, cancel: 1 }]  or  [{ order: <id>, cancel: { error: "..." } }]
+    let cancelSuccess = false;
+    let japErrMsg     = "";
+
+    if (Array.isArray(japResponse)) {
+      const entry = japResponse.find(r => String(r.order) === String(order.providerOrderId))
+                 || japResponse[0];
+      if (entry) {
+        if (entry.cancel === 1 || entry.cancel === "1") {
+          cancelSuccess = true;
+        } else if (entry.cancel && typeof entry.cancel === "object" && entry.cancel.error) {
+          japErrMsg = entry.cancel.error;
+        } else if (entry.cancel) {
+          cancelSuccess = true;   // numeric non-error value = success
+        }
+      }
+    } else if (japResponse && typeof japResponse === "object") {
+      // Some panels return a single object
+      if (japResponse.cancel === 1 || japResponse.cancel === "1") cancelSuccess = true;
+      else if (japResponse.error) japErrMsg = japResponse.error;
+      else cancelSuccess = true;
+    }
+
+    // ── 5a. JAP refused cancel ───────────────────────────
+    if (!cancelSuccess) {
+      await session.abortTransaction(); session.endSession();
+      console.warn(`[CANCEL] JAP refused: ${japErrMsg}`);
+      return res.status(400).json({
+        message: japErrMsg
+          ? `JAP refused cancel: ${japErrMsg}`
+          : "Order cannot be canceled at this time (JAP rejected the request)",
+        providerResponse: japResponse,
+      });
+    }
+
+    // ── 5b. Cancel succeeded — calculate refund ──────────
+    /*
+     * Refund formula:
+     *   delivered  = quantity - remains
+     *   Full refund   → remains >= quantity (nothing delivered)
+     *   Partial refund → remains > 0 (partially delivered)
+     *   No refund      → remains === 0 (fully delivered — rare at cancel)
+     */
+    const quantity   = order.quantity   || 1;
+    const chargeMMK  = order.chargeMMK  || 0;
+    let   refundMMK  = 0;
+    let   refundType = "none";
+
+    if (freshRemains >= quantity) {
+      // Nothing delivered → full refund
+      refundMMK  = chargeMMK;
+      refundType = "full";
+    } else if (freshRemains > 0) {
+      // Partial delivery → proportional refund
+      refundMMK  = Math.floor(chargeMMK * (freshRemains / quantity));
+      refundType = "partial";
+    }
+    // remains === 0: nothing left to refund
+
+    // Update order status
+    order.status = "Canceled";
+    await order.save({ session });
+
+    // Credit refund to user balance (atomic)
+    let newBalance = null;
+    if (refundMMK > 0) {
+      const updatedUser = await User.findByIdAndUpdate(
+        req.uid,
+        { $inc: { balance: refundMMK, balanceSpent: -refundMMK } },
+        { new: true, session }
+      );
+      newBalance = updatedUser.balance;
+      console.log(`[CANCEL] Refund ${refundType}: ${refundMMK} Ks → user ${req.uid}`);
+    }
+
+    await session.commitTransaction();
+    session.endSession();
+
+    res.json({
+      message:   `Order canceled. ${refundMMK > 0 ? refundMMK.toLocaleString() + " Ks refunded to your balance." : "No refund (order was fully delivered)."}`,
+      refundMMK,
+      refundType,    // "full" | "partial" | "none"
+      newBalance,
+      order: { _id: order._id, status: order.status, remains: order.remains },
+    });
+
+  } catch (e) {
+    await session.abortTransaction();
+    session.endSession();
+    console.error("[CANCEL ERR]", e.message);
+    res.status(500).json({ message: "Cancel failed: " + e.message });
+  }
 });
 
 
