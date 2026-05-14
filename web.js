@@ -24,29 +24,21 @@ const upload = multer({
 /* ══════════════════════════════════════════════════════════
    ENV VARS
 ══════════════════════════════════════════════════════════ */
-const PORT        = process.env.PORT        || 5000;
-const MONGODB_URI = process.env.MONGODB_URI;
-const JWT_SECRET  = process.env.JWT_SECRET;
-const JAP_API_KEY   = process.env.JAP_API_KEY   || "";
-const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
-const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "")
+const PORT           = process.env.PORT           || 5000;
+const MONGODB_URI    = process.env.MONGODB_URI;
+const JWT_SECRET     = process.env.JWT_SECRET;
+const JAP_API_KEY    = process.env.JAP_API_KEY    || "";
+const JAP_API_URL    = process.env.JAP_API_URL    || "https://justanotherpanel.com/api/v2";
+const IMGBB_API_KEY  = process.env.IMGBB_API_KEY  || "";
+const ADMIN_EMAILS   = (process.env.ADMIN_EMAILS  || "")
   .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
-const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
-const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
-const MARKUP         = parseFloat(process.env.MARKUP   || "1.2");
-const FRONTEND_URL   = process.env.FRONTEND_URL || "https://your-frontend.vercel.app";
-const EMAIL_USER     = process.env.EMAIL_USER   || "";
-const EMAIL_PASS     = process.env.EMAIL_PASS   || "";
-
-if (!EMAIL_USER || !EMAIL_PASS) console.warn("⚠️  EMAIL_USER / EMAIL_PASS not set — emails won't send");
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(u => u.trim()).filter(Boolean);
-
-// ── Email (nodemailer) ─────────────────────────────────
-const EMAIL_FROM    = process.env.EMAIL_FROM    || "";  // e.g. noreply@thenetsmm.com
-const EMAIL_USER    = process.env.EMAIL_USER    || "";  // Gmail address
-const EMAIL_PASS    = process.env.EMAIL_PASS    || "";  // Gmail App Password
-const FRONTEND_URL  = process.env.FRONTEND_URL  || "https://thenetsmm-frontend.vercel.app";
+const MMK_RATE       = parseFloat(process.env.MMK_RATE  || "4500");
+const MARKUP         = parseFloat(process.env.MARKUP    || "1.2");
+const FRONTEND_URL   = process.env.FRONTEND_URL   || "https://your-frontend.vercel.app";
+const EMAIL_USER     = process.env.EMAIL_USER     || "";
+const EMAIL_PASS     = process.env.EMAIL_PASS     || "";
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
