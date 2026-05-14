@@ -1,22 +1,29 @@
 {
   "name": "smm-panel-backend",
   "version": "1.0.0",
-  "description": "SMM Panel API — Just Another Panel (JAP)",
+  "description": "SMM Panel API \u2014 Just Another Panel (JAP)",
   "main": "web.js",
   "scripts": {
     "start": "node web.js",
-    "dev": "nodemon web.js"
+    "dev": "nodemon web.js",
+    "audit": "npm audit"
   },
-  "engines": { "node": ">=18.0.0" },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "axios":        "^1.6.8",
-    "multer":       "^1.4.5-lts.1",
-    "bcryptjs":     "^2.4.3",
-    "cors":         "^2.8.5",
-    "dotenv":       "^16.3.1",
-    "express":      "^4.18.2",
+    "axios": "^1.6.8",
+    "multer": "^1.4.5-lts.1",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "mongoose":     "^8.0.3"
+    "mongoose": "^8.0.3",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "express-mongo-sanitize": "^2.2.0",
+    "nodemailer": "^6.9.8"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

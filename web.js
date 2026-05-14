@@ -1,13 +1,20 @@
 "use strict";
 require("dotenv").config();
 
-const express   = require("express");
-const cors      = require("cors");
-const mongoose  = require("mongoose");
-const bcrypt    = require("bcryptjs");
-const jwt       = require("jsonwebtoken");
-const axios     = require("axios");
-const multer    = require("multer");
+const express      = require("express");
+const cors         = require("cors");
+const mongoose     = require("mongoose");
+const bcrypt       = require("bcryptjs");
+const jwt          = require("jsonwebtoken");
+const axios        = require("axios");
+const multer       = require("multer");
+const crypto       = require("crypto");           // built-in
+const nodemailer   = require("nodemailer");
+const crypto       = require("crypto");
+const nodemailer   = require("nodemailer");
+const helmet       = require("helmet");
+const rateLimit    = require("express-rate-limit");
+const mongoSanitize = require("express-mongo-sanitize");
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -28,7 +35,20 @@ const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "")
   .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
 const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
 const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
-const MARKUP      = parseFloat(process.env.MARKUP   || "1.2");
+const MARKUP         = parseFloat(process.env.MARKUP   || "1.2");
+const FRONTEND_URL   = process.env.FRONTEND_URL || "https://your-frontend.vercel.app";
+const EMAIL_USER     = process.env.EMAIL_USER   || "";
+const EMAIL_PASS     = process.env.EMAIL_PASS   || "";
+
+if (!EMAIL_USER || !EMAIL_PASS) console.warn("⚠️  EMAIL_USER / EMAIL_PASS not set — emails won't send");
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(u => u.trim()).filter(Boolean);
+
+// ── Email (nodemailer) ─────────────────────────────────
+const EMAIL_FROM    = process.env.EMAIL_FROM    || "";  // e.g. noreply@thenetsmm.com
+const EMAIL_USER    = process.env.EMAIL_USER    || "";  // Gmail address
+const EMAIL_PASS    = process.env.EMAIL_PASS    || "";  // Gmail App Password
+const FRONTEND_URL  = process.env.FRONTEND_URL  || "https://thenetsmm-frontend.vercel.app";
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
@@ -38,28 +58,160 @@ if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload
 const app = express();
 
 /* ══════════════════════════════════════════════════════════
-   CORS
+   NODEMAILER — Gmail transporter
 ══════════════════════════════════════════════════════════ */
-app.use(cors({
-  origin: [/\.vercel\.app$/, "http://localhost:3000", "http://localhost:5500", "http://127.0.0.1:5500"],
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
-  credentials: true,
+const mailer = nodemailer.createTransport({
+  service: "gmail",
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+});
+
+async function sendMail({ to, subject, html }) {
+  const info = await mailer.sendMail({
+    from:    `"TheNetSMM" <${EMAIL_USER}>`,
+    to, subject, html,
+  });
+  console.log(`[MAIL] Sent to ${to}: ${info.messageId}`);
+  return info;
+}
+
+/* ── Email templates ──────────────────────────────────── */
+function tplVerify(link) {
+  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
+    <h2 style="color:#5B1AB0">TheNetSMM</h2>
+    <p>Hello,</p>
+    <p>Thank you for registering an account with thenetsmm.com. To complete your registration and verify your email address, please click the button below:</p>
+    <p style="text-align:center;margin:30px 0">
+      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Confirm Account</a>
+    </p>
+    <p>If you did not create an account, you can safely ignore this email.</p>
+    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
+  </div>`;
+}
+
+function tplReset(link) {
+  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
+    <h2 style="color:#5B1AB0">TheNetSMM</h2>
+    <p>Hello,</p>
+    <p>You requested a password change. To proceed, click the button below:</p>
+    <p style="text-align:center;margin:30px 0">
+      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Reset Password</a>
+    </p>
+    <p>If you did not request it, you can safely ignore this message. Only a person with access to your email, can reset your password.</p>
+    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
+  </div>`;
+}
+
+/* ══════════════════════════════════════════════════════════
+   SECURITY MIDDLEWARE
+══════════════════════════════════════════════════════════ */
+
+// ── Helmet — secure HTTP headers ──────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'self'", "'unsafe-inline'", "https://api.imgbb.com"],
+      styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      imgSrc:     ["'self'", "data:", "https://i.ibb.co", "https://*.ibb.co"],
+      connectSrc: ["'self'", "https://justanotherpanel.com", "https://api.imgbb.com"],
+      fontSrc:    ["'self'", "https://fonts.gstatic.com"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
 }));
-app.use(express.json());
+
+// ── CORS — restrict to known origins ──────────────────────
+const VERCEL_ORIGINS = ALLOWED_ORIGINS.length > 0
+  ? ALLOWED_ORIGINS
+  : [/\.vercel\.app$/, "http://localhost:3000", "http://localhost:5500", "http://127.0.0.1:5500"];
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);   // same-origin / Postman
+    const allowed = Array.isArray(VERCEL_ORIGINS) ? VERCEL_ORIGINS : [VERCEL_ORIGINS];
+    const ok = allowed.some(o =>
+      typeof o === "string" ? o === origin : o.test(origin)
+    );
+    if (ok) return cb(null, true);
+    console.warn("[CORS] Blocked:", origin);
+    return cb(new Error("CORS policy: origin not allowed"));
+  },
+  methods:        ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+  credentials:    true,
+}));
+
+// ── Body parsing & NoSQL injection prevention ─────────────
+app.use(express.json({ limit: "2mb" }));
+app.use(mongoSanitize({             // strip $ and . from user input
+  replaceWith: "_",
+  onSanitize: ({ req, key }) => {
+    console.warn(`[SECURITY] Sanitized field "${key}" from ${req.ip}`);
+  },
+}));
+
+/* ── Rate limiters ──────────────────────────────────────────
+   Brute-force protection for auth endpoints                  */
+const authLimiter = rateLimit({
+  windowMs:         15 * 60 * 1000,   // 15 minutes
+  max:              20,                // 20 attempts per window per IP
+  standardHeaders:  true,
+  legacyHeaders:    false,
+  message:          { message: "Too many login attempts. Please try again in 15 minutes." },
+  handler(req, res, next, options) {
+    console.warn(`[RATE LIMIT] Auth limit hit: ${req.ip}`);
+    res.status(429).json(options.message);
+  },
+});
+
+const apiLimiter = rateLimit({
+  windowMs:  1 * 60 * 1000,    // 1 minute
+  max:       60,                // 60 requests/min per IP
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:   { message: "Too many requests. Please slow down." },
+});
+
+app.use("/api/", apiLimiter);   // apply globally
+
+/* ── Request logger (lightweight) ───────────────────────── */
+const isProd = process.env.NODE_ENV === "production";
+app.use((req, _, next) => {
+  if (!isProd) console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
 
 /* ══════════════════════════════════════════════════════════
    SCHEMAS
 ══════════════════════════════════════════════════════════ */
 const userSchema = new mongoose.Schema({
-  name:         { type: String, required: true, trim: true },
-  email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
-  password:     { type: String, required: true },
-  balance:      { type: Number, default: 0 },
-  balanceSpent: { type: Number, default: 0 },
-  totalOrders:  { type: Number, default: 0 },
-  isAdmin:      { type: Boolean, default: false },
+  name:          { type: String, required: true, trim: true },
+  email:         { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password:      { type: String, required: true },
+  balance:       { type: Number, default: 0 },
+  balanceSpent:  { type: Number, default: 0 },
+  totalOrders:   { type: Number, default: 0 },
+  isAdmin:       { type: Boolean, default: false },
+  loginAttempts: { type: Number, default: 0 },
+  lockUntil:     { type: Date,   default: null },
+
+  // ── Email Verification ──────────────────────────────
+  isVerified:               { type: Boolean, default: false },
+  verificationToken:        { type: String,  default: null },
+  verificationTokenExpires: { type: Date,    default: null },
+
+  // ── Password Reset ──────────────────────────────────
+  resetPasswordToken:   { type: String, default: null },
+  resetPasswordExpires: { type: Date,   default: null },
+
 }, { timestamps: true });
+
+// ── Performance indexes ────────────────────────────────
+userSchema.index({ email: 1 });
+userSchema.index({ name:  1 });
+userSchema.index({ verificationToken:  1 }, { sparse: true });
+userSchema.index({ resetPasswordToken: 1 }, { sparse: true });
+
 const User = mongoose.model("User", userSchema);
 
 /* ── FundRequest (Deposit) ────────────────────────────────── */
@@ -73,6 +225,8 @@ const fundRequestSchema = new mongoose.Schema({
                    default: "Pending" },
   adminNotes:    { type: String, default: "" },
 }, { timestamps: true });
+fundRequestSchema.index({ userId: 1, createdAt: -1 });
+fundRequestSchema.index({ status: 1 });
 const FundRequest = mongoose.model("FundRequest", fundRequestSchema);
 
 const orderSchema = new mongoose.Schema({
@@ -90,6 +244,9 @@ const orderSchema = new mongoose.Schema({
   remains:         { type: Number, default: 0 },          // JAP: remains
   providerError:   { type: String, default: null },
 }, { timestamps: true });
+// ── Performance indexes ────────────────────────────────
+orderSchema.index({ user: 1, createdAt: -1 });
+orderSchema.index({ user: 1, status: 1 });
 const Order = mongoose.model("Order", orderSchema);
 
 /* ══════════════════════════════════════════════════════════
@@ -98,13 +255,30 @@ const Order = mongoose.model("Order", orderSchema);
 const makeToken = (id) => jwt.sign({ id }, JWT_SECRET, { expiresIn: "7d" });
 
 const safeUser = (u) => ({
-  id: u._id, name: u.name, email: u.email,
-  balance: u.balance, balanceSpent: u.balanceSpent,
-  totalOrders: u.totalOrders, createdAt: u.createdAt,
-  isAdmin: !!(u.isAdmin || ADMIN_EMAILS.includes((u.email||"").toLowerCase())),
+  id:           u._id,
+  name:         sanitizeStr(u.name),
+  email:        sanitizeStr(u.email),
+  balance:      u.balance       || 0,
+  balanceSpent: u.balanceSpent  || 0,
+  totalOrders:  u.totalOrders   || 0,
+  createdAt:    u.createdAt,
+  isAdmin:      !!(u.isAdmin || ADMIN_EMAILS.includes((u.email||"").toLowerCase())),
+  // Never expose: password, loginAttempts, lockUntil
 });
 
+/* ── Sanitize output strings (prevent XSS via API responses) */
+function sanitizeStr(s) {
+  if (typeof s !== "string") return s;
+  return s.replace(/[<>&"']/g, c => ({
+    "<":"&lt;", ">":"&gt;", "&":"&amp;", '"':"&quot;", "'":"&#x27;",
+  }[c]));
+}
+
 const normEmail = (e) => String(e || "").toLowerCase().trim();
+
+/* ── Input validation ─────────────────────────────────────*/
+const isEmail   = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+const isMongoId = (id) => /^[0-9a-fA-F]{24}$/.test(String(id || ""));
 
 /* ── Auth middleware ─────────────────────────────────────*/
 function guard(req, res, next) {
@@ -261,49 +435,219 @@ async function japAPI(params, _retry = false) {
 ══════════════════════════════════════════════════════════ */
 app.get("/", (_, res) => res.json({ status: "running", provider: "JAP", time: new Date() }));
 
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", authLimiter, async (req, res) => {
   try {
     const { name, password } = req.body;
     const email = normEmail(req.body.email);
     if (!name || !email || !password)
       return res.status(400).json({ message: "Please fill in all fields" });
+    if (!isEmail(email))
+      return res.status(400).json({ message: "Invalid email format" });
     if (password.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     if (await User.findOne({ email }))
-      return res.status(400).json({ message: "Email already registered" });
-    const user = await User.create({ name, email, password: await bcrypt.hash(password, 12) });
-    res.status(201).json({ message: "Account created", token: makeToken(user._id), user: safeUser(user) });
-  } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
+      return res.status(400).json({ message: "An account with this email already exists" });
+
+    // ── Generate verification token (raw → send, hashed → store)
+    const rawToken    = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const expires     = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    const user = await User.create({
+      name, email,
+      password:                await bcrypt.hash(password, 10),
+      isVerified:              false,
+      verificationToken:       hashedToken,
+      verificationTokenExpires: expires,
+    });
+
+    // ── Send verification email ───────────────────────────
+    const link = `${FRONTEND_URL}/verify-email?token=${rawToken}`;
+    try {
+      await sendMail({
+        to:      email,
+        subject: "Confirm your TheNetSMM account",
+        html:    tplVerify(link),
+      });
+      console.log(`[SIGNUP] Verification email sent to ${email}`);
+    } catch (mailErr) {
+      // Delete user if email fails — avoid unverified zombie accounts
+      await User.findByIdAndDelete(user._id);
+      console.error("[SIGNUP] Email failed:", mailErr.message);
+      return res.status(500).json({ message: "Could not send verification email. Please try again." });
+    }
+
+    res.status(201).json({
+      message: "Account created! Please check your email and click the confirmation link to activate your account.",
+    });
+  } catch (e) {
+    console.error("[SIGNUP ERR]", e.message);
+    res.status(500).json({ message: "Server error. Please try again." });
+  }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+/* ── GET /api/auth/verify-email?token=<rawToken>
+   Frontend calls this after user clicks email link          */
+app.get("/api/auth/verify-email", async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ message: "Verification token is required" });
+
+    const hashedToken = crypto.createHash("sha256").update(String(token)).digest("hex");
+    const user = await User.findOne({
+      verificationToken:        hashedToken,
+      verificationTokenExpires: { $gt: Date.now() },
+    });
+
+    if (!user) return res.status(400).json({ message: "Token is invalid or has expired. Please register again." });
+    if (user.isVerified) return res.json({ message: "Email already verified. You can log in." });
+
+    user.isVerified              = true;
+    user.verificationToken       = undefined;
+    user.verificationTokenExpires = undefined;
+    await user.save();
+
+    console.log(`[VERIFY] Email verified: ${user.email}`);
+    res.json({ message: "Email verified! Your account is now active. You can log in." });
+  } catch (e) {
+    console.error("[VERIFY ERR]", e.message);
+    res.status(500).json({ message: "Verification failed. Please try again." });
+  }
+});
+
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
     const { password } = req.body;
-    const input = String(req.body.email || req.body.username || "").trim();
+    const input = String(req.body.email || req.body.username || "").trim().toLowerCase();
     if (!input || !password)
       return res.status(400).json({ message: "Please fill in all fields" });
+
+    // Exact email match only (no $regex — prevents ReDoS + injection)
     const user = await User.findOne({
-      $or: [{ email: input.toLowerCase() }, { name: { $regex: `^${input}$`, $options: "i" } }],
-    });
-    if (!user || !(await bcrypt.compare(password, user.password)))
+      $or: [{ email: input }, { name: input }],
+    }).select("+loginAttempts +lockUntil");
+
+    // ── Account lockout check ─────────────────────────────
+    if (user && user.lockUntil && user.lockUntil > Date.now()) {
+      const wait = Math.ceil((user.lockUntil - Date.now()) / 1000 / 60);
+      return res.status(423).json({
+        message: `Account locked. Try again in ${wait} minute(s).`,
+      });
+    }
+
+    const valid = user && await bcrypt.compare(password, user.password);
+
+    // ── Email verification check ──────────────────────────
+    if (valid && user && !user.isVerified) {
+      return res.status(403).json({
+        message: "Please verify your email before logging in. Check your inbox for the confirmation link.",
+      });
+    }
+
+    if (!valid) {
+      // Increment failed attempts
+      if (user) {
+        const attempts = (user.loginAttempts || 0) + 1;
+        const update   = { loginAttempts: attempts };
+        if (attempts >= 5) {
+          update.lockUntil = new Date(Date.now() + 15 * 60 * 1000); // lock 15 min
+          console.warn(`[SECURITY] Account locked: ${user.email} after ${attempts} attempts`);
+        }
+        await User.findByIdAndUpdate(user._id, update);
+      }
       return res.status(401).json({ message: "Invalid username or password" });
+    }
+
+    // ── Success — reset lockout ───────────────────────────
+    if (user.loginAttempts > 0 || user.lockUntil) {
+      await User.findByIdAndUpdate(user._id, {
+        $set: { loginAttempts: 0, lockUntil: null },
+      });
+    }
+
+    console.log(`[AUTH] Login: ${user.email} from ${req.ip}`);
     res.json({ message: "Login successful", token: makeToken(user._id), user: safeUser(user) });
-  } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
+  } catch (e) {
+    console.error("[LOGIN ERR]", e.message);
+    res.status(500).json({ message: "Server error. Please try again." });
+  }
 });
 
-app.post("/api/auth/reset-password", async (req, res) => {
+/* ── POST /api/auth/forgot-password
+   Step 1: User submits email → send reset link              */
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   try {
-    const { newPassword } = req.body;
     const email = normEmail(req.body.email);
-    if (!email || !newPassword)
-      return res.status(400).json({ message: "Email and new password are required" });
+    if (!email || !isEmail(email))
+      return res.status(400).json({ message: "Valid email is required" });
+
+    const user = await User.findOne({ email });
+
+    // Always reply success — prevents email enumeration attacks
+    const genericMsg = "If that email exists in our system, a password reset link has been sent.";
+
+    if (!user) return res.json({ message: genericMsg });
+    if (!user.isVerified) return res.json({ message: genericMsg }); // don't reveal why
+
+    const rawToken    = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const expires     = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    user.resetPasswordToken   = hashedToken;
+    user.resetPasswordExpires = expires;
+    await user.save();
+
+    const link = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
+    try {
+      await sendMail({
+        to:      email,
+        subject: "Reset your TheNetSMM password",
+        html:    tplReset(link),
+      });
+      console.log(`[FORGOT] Reset email sent to ${email}`);
+    } catch (mailErr) {
+      console.error("[FORGOT] Email failed:", mailErr.message);
+      return res.status(500).json({ message: "Could not send reset email. Please try again." });
+    }
+
+    res.json({ message: genericMsg });
+  } catch (e) {
+    console.error("[FORGOT ERR]", e.message);
+    res.status(500).json({ message: "Server error. Please try again." });
+  }
+});
+
+/* ── POST /api/auth/reset-password
+   Step 2: User submits new password + token from email link */
+app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword)
+      return res.status(400).json({ message: "Token and new password are required" });
     if (newPassword.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "No account found with this email" });
-    await User.updateOne({ email }, { $set: { password: await bcrypt.hash(newPassword, 12) } });
-    res.json({ message: "Password reset successfully. You can now log in." });
-  } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
+
+    const hashedToken = crypto.createHash("sha256").update(String(token)).digest("hex");
+    const user = await User.findOne({
+      resetPasswordToken:   hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+
+    if (!user) return res.status(400).json({ message: "Reset token is invalid or has expired. Please request a new one." });
+
+    user.password             = await bcrypt.hash(newPassword, 10);
+    user.resetPasswordToken   = undefined;
+    user.resetPasswordExpires = undefined;
+    user.loginAttempts        = 0;    // clear any lockout
+    user.lockUntil            = null;
+    await user.save();
+
+    console.log(`[RESET] Password reset: ${user.email}`);
+    res.json({ message: "Password reset successfully! You can now log in with your new password." });
+  } catch (e) {
+    console.error("[RESET ERR]", e.message);
+    res.status(500).json({ message: "Server error. Please try again." });
+  }
 });
 
 app.get("/api/auth/me", guard, async (req, res) => {
@@ -466,7 +810,7 @@ app.get("/api/orders", guard, async (req, res) => {
     const filter = { user: req.uid };
     if (req.query.status) filter.status = req.query.status;
     const [orders, total] = await Promise.all([
-      Order.find(filter).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit),
+      Order.find(filter).sort({ createdAt: -1 }).skip((page-1)*limit).limit(limit).lean(),
       Order.countDocuments(filter),
     ]);
     res.json({ orders, pagination: { page, limit, total, pages: Math.ceil(total/limit) } });
@@ -476,10 +820,12 @@ app.get("/api/orders", guard, async (req, res) => {
 /* GET /api/orders/:id */
 app.get("/api/orders/:id", guard, async (req, res) => {
   try {
-    const order = await Order.findOne({ _id: req.params.id, user: req.uid });
+    if (!isMongoId(req.params.id))
+      return res.status(400).json({ message: "Invalid order ID" });
+    const order = await Order.findOne({ _id: req.params.id, user: req.uid }).lean();
     if (!order) return res.status(404).json({ message: "Order not found" });
     res.json(order);
-  } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
+  } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
 /*
@@ -894,9 +1240,23 @@ app.patch("/api/admin/users/:id/balance", adminGuard, async (req, res) => {
 });
 
 /* ══════════════════════════════════════════════════════════
-   404
+   404 + Global Error Handler
 ══════════════════════════════════════════════════════════ */
 app.use((_, res) => res.status(404).json({ message: "Route not found" }));
+
+// Global error middleware — never expose stack traces to client
+app.use((err, req, res, next) => {           // eslint-disable-line no-unused-vars
+  const status = err.status || err.statusCode || 500;
+  const isProd  = process.env.NODE_ENV === "production";
+
+  console.error(`[ERROR] ${req.method} ${req.path} →`, err.message);
+
+  res.status(status).json({
+    message: isProd && status === 500
+      ? "An internal error occurred. Please try again."
+      : err.message || "Unexpected error",
+  });
+});
 
 /* ══════════════════════════════════════════════════════════
    START
