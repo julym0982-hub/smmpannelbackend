@@ -9,7 +9,7 @@ const jwt          = require("jsonwebtoken");
 const axios        = require("axios");
 const multer       = require("multer");
 const crypto       = require("crypto");           // built-in
-const { Resend }   = require("resend");
+const nodemailer   = require("nodemailer");
 const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
@@ -38,7 +38,8 @@ const MMK_RATE       = parseFloat(process.env.MMK_RATE  || "4500");
 const MARKUP         = parseFloat(process.env.MARKUP    || "1.2");
 const FRONTEND_URL   = process.env.FRONTEND_URL   || "https://your-frontend.vercel.app";
 const EMAIL_USER     = process.env.EMAIL_USER     || "";
-const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const BREVO_USER     = process.env.BREVO_USER     || "";
+const BREVO_PASS     = process.env.BREVO_PASS     || "";
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
@@ -55,35 +56,37 @@ app.set('trust proxy', 1);
 /* ══════════════════════════════════════════════════════════
    RESEND — HTTP Email API (works on Render/Vercel, no SMTP needed)
 ══════════════════════════════════════════════════════════ */
-const resend = new Resend(RESEND_API_KEY);
+const mailer = nodemailer.createTransport({
+  host:   "smtp-relay.brevo.com",   // Brevo SMTP — works on Render, no domain needed
+  port:   587,
+  secure: false,                    // STARTTLS
+  auth: {
+    user: BREVO_USER,               // your Brevo login email
+    pass: BREVO_PASS,               // Brevo SMTP key (not account password)
+  },
+});
 
-if (!RESEND_API_KEY) {
-  console.warn("⚠️  RESEND_API_KEY not set — emails won't send");
+// Test connection on startup
+if (BREVO_USER && BREVO_PASS) {
+  mailer.verify((err) => {
+    if (err) console.error("❌ [MAIL] Brevo SMTP failed:", err.message);
+    else     console.log("✅ [MAIL] Brevo SMTP ready as:", BREVO_USER);
+  });
 } else {
-  console.log("✅ [MAIL] Resend configured — FROM:", EMAIL_USER || "noreply@thenetsmm.com");
+  console.warn("⚠️  [MAIL] BREVO_USER / BREVO_PASS not set — emails disabled");
 }
 
 async function sendMail({ to, subject, html }) {
-  if (!RESEND_API_KEY) {
-    console.error("[MAIL] Cannot send — RESEND_API_KEY not set");
+  if (!BREVO_USER || !BREVO_PASS) {
     throw new Error("Email service not configured. Contact admin.");
   }
   try {
-    // Use verified Resend test address by default.
-    // To use custom domain: verify it at resend.com/domains
-    // then set EMAIL_FROM=noreply@yourdomain.com in ENV
-    const EMAIL_FROM = process.env.EMAIL_FROM || "";
-    const from = EMAIL_FROM
-      ? `TheNetSMM <${EMAIL_FROM}>`
-      : "TheNetSMM <onboarding@resend.dev>";
-
-    const { data, error } = await resend.emails.send({ from, to, subject, html });
-    if (error) {
-      console.error("❌ [MAIL] Resend error:", JSON.stringify(error));
-      throw new Error(error.message || "Email send failed");
-    }
-    console.log(`✅ [MAIL] Sent → ${to} | id: ${data.id}`);
-    return data;
+    const info = await mailer.sendMail({
+      from:    `"TheNetSMM" <${BREVO_USER}>`,
+      to, subject, html,
+    });
+    console.log(`✅ [MAIL] Sent → ${to} | id: ${info.messageId}`);
+    return info;
   } catch (err) {
     console.error(`❌ [MAIL] Failed → ${to}:`, err.message);
     throw err;
@@ -624,7 +627,7 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
       console.log(`[FORGOT] Reset email sent to ${email}`);
     } catch (mailErr) {
       console.error("[FORGOT] Email failed:", mailErr.message);
-      console.error("[FORGOT] RESEND_API_KEY set:", !!RESEND_API_KEY);
+      console.error("[FORGOT] BREVO_USER set:", !!BREVO_USER);
       return res.status(500).json({
         message: "Could not send reset email: " + mailErr.message + ". Check server EMAIL configuration.",
       });
