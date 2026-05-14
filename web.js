@@ -9,7 +9,7 @@ const jwt          = require("jsonwebtoken");
 const axios        = require("axios");
 const multer       = require("multer");
 const crypto       = require("crypto");           // built-in
-const nodemailer   = require("nodemailer");
+const { Resend }   = require("resend");
 const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
@@ -38,7 +38,7 @@ const MMK_RATE       = parseFloat(process.env.MMK_RATE  || "4500");
 const MARKUP         = parseFloat(process.env.MARKUP    || "1.2");
 const FRONTEND_URL   = process.env.FRONTEND_URL   || "https://your-frontend.vercel.app";
 const EMAIL_USER     = process.env.EMAIL_USER     || "";
-const EMAIL_PASS     = process.env.EMAIL_PASS     || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
@@ -53,73 +53,40 @@ const app = express();
 app.set('trust proxy', 1);
 
 /* ══════════════════════════════════════════════════════════
-   NODEMAILER — Gmail transporter
+   RESEND — HTTP Email API (works on Render/Vercel, no SMTP needed)
 ══════════════════════════════════════════════════════════ */
-const mailer = nodemailer.createTransport({
-  service: "gmail",
-  auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-  tls: { rejectUnauthorized: false },   // avoid cert issues on Render
-});
+const resend = new Resend(RESEND_API_KEY);
 
-/* Verify SMTP connection on startup */
-if (EMAIL_USER && EMAIL_PASS) {
-  mailer.verify((err) => {
-    if (err) {
-      console.error("❌ [MAIL] SMTP connection FAILED:", err.message);
-      console.error("   → Check EMAIL_USER and EMAIL_PASS in Render ENV");
-    } else {
-      console.log("✅ [MAIL] SMTP ready — Gmail connected as:", EMAIL_USER);
-    }
-  });
+if (!RESEND_API_KEY) {
+  console.warn("⚠️  RESEND_API_KEY not set — emails won't send");
 } else {
-  console.warn("⚠️  [MAIL] EMAIL_USER or EMAIL_PASS is empty — emails disabled");
+  console.log("✅ [MAIL] Resend configured — FROM:", EMAIL_USER || "noreply@thenetsmm.com");
 }
 
 async function sendMail({ to, subject, html }) {
-  if (!EMAIL_USER || !EMAIL_PASS) {
-    console.error("[MAIL] Cannot send — EMAIL_USER/EMAIL_PASS not set in ENV");
+  if (!RESEND_API_KEY) {
+    console.error("[MAIL] Cannot send — RESEND_API_KEY not set");
     throw new Error("Email service not configured. Contact admin.");
   }
   try {
-    const info = await mailer.sendMail({
-      from:    `"TheNetSMM" <${EMAIL_USER}>`,
-      to, subject, html,
-    });
-    console.log(`✅ [MAIL] Sent → ${to} | id: ${info.messageId}`);
-    return info;
+    const from = EMAIL_USER
+      ? `TheNetSMM <${EMAIL_USER}>`
+      : "TheNetSMM <onboarding@resend.dev>";  // Resend test address
+
+    const { data, error } = await resend.emails.send({ from, to, subject, html });
+    if (error) {
+      console.error("❌ [MAIL] Resend error:", JSON.stringify(error));
+      throw new Error(error.message || "Email send failed");
+    }
+    console.log(`✅ [MAIL] Sent → ${to} | id: ${data.id}`);
+    return data;
   } catch (err) {
-    console.error(`❌ [MAIL] Failed to send to ${to}:`, err.message);
+    console.error(`❌ [MAIL] Failed → ${to}:`, err.message);
     throw err;
   }
 }
 
 /* ── Email templates ──────────────────────────────────── */
-function tplVerify(link) {
-  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
-    <h2 style="color:#5B1AB0">TheNetSMM</h2>
-    <p>Hello,</p>
-    <p>Thank you for registering an account with thenetsmm.com. To complete your registration and verify your email address, please click the button below:</p>
-    <p style="text-align:center;margin:30px 0">
-      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Confirm Account</a>
-    </p>
-    <p>If you did not create an account, you can safely ignore this email.</p>
-    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
-  </div>`;
-}
-
-function tplReset(link) {
-  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
-    <h2 style="color:#5B1AB0">TheNetSMM</h2>
-    <p>Hello,</p>
-    <p>You requested a password change. To proceed, click the button below:</p>
-    <p style="text-align:center;margin:30px 0">
-      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Reset Password</a>
-    </p>
-    <p>If you did not request it, you can safely ignore this message. Only a person with access to your email, can reset your password.</p>
-    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
-  </div>`;
-}
-
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
 ══════════════════════════════════════════════════════════ */
@@ -626,7 +593,7 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
       console.log(`[FORGOT] Reset email sent to ${email}`);
     } catch (mailErr) {
       console.error("[FORGOT] Email failed:", mailErr.message);
-      console.error("[FORGOT] EMAIL_USER:", EMAIL_USER || "(not set)");
+      console.error("[FORGOT] RESEND_API_KEY set:", !!RESEND_API_KEY);
       return res.status(500).json({
         message: "Could not send reset email: " + mailErr.message + ". Check server EMAIL configuration.",
       });
