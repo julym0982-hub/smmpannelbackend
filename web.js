@@ -8,10 +8,10 @@ const bcrypt       = require("bcryptjs");
 const jwt          = require("jsonwebtoken");
 const axios        = require("axios");
 const multer       = require("multer");
-const crypto       = require("crypto");           // built-in
 const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
+const cookieParser  = require("cookie-parser");
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -23,22 +23,18 @@ const upload = multer({
 /* ══════════════════════════════════════════════════════════
    ENV VARS
 ══════════════════════════════════════════════════════════ */
-const PORT           = process.env.PORT           || 5000;
-const MONGODB_URI    = process.env.MONGODB_URI;
-const JWT_SECRET     = process.env.JWT_SECRET;
-const JAP_API_KEY    = process.env.JAP_API_KEY    || "";
-const JAP_API_URL    = process.env.JAP_API_URL    || "https://justanotherpanel.com/api/v2";
-const IMGBB_API_KEY  = process.env.IMGBB_API_KEY  || "";
-const ADMIN_EMAILS   = (process.env.ADMIN_EMAILS  || "")
+const PORT        = process.env.PORT        || 5000;
+const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET  = process.env.JWT_SECRET;
+const JAP_API_KEY   = process.env.JAP_API_KEY   || "";
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
+const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "")
   .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
+const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
+const MARKUP         = parseFloat(process.env.MARKUP   || "1.2");
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(u => u.trim()).filter(Boolean);
-const MMK_RATE       = parseFloat(process.env.MMK_RATE  || "4500");
-const MARKUP         = parseFloat(process.env.MARKUP    || "1.2");
-const FRONTEND_URL   = process.env.FRONTEND_URL   || "https://your-frontend.vercel.app";
-const EMAIL_USER     = process.env.EMAIL_USER     || "";
-const BREVO_API_KEY  = process.env.BREVO_API_KEY  || "";
-const EMAIL_FROM     = process.env.EMAIL_FROM     || "noreply@thenetsmm.com";
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
@@ -46,74 +42,6 @@ if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
 if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
-
-/* ── Trust proxy (required for Render / Heroku / Vercel) ──
-   Without this, express-rate-limit throws ValidationError
-   when X-Forwarded-For header is present from the proxy.  */
-app.set('trust proxy', 1);
-
-/* ══════════════════════════════════════════════════════════
-   RESEND — HTTP Email API (works on Render/Vercel, no SMTP needed)
-══════════════════════════════════════════════════════════ */
-/* Brevo HTTP API — no SMTP, works on all hosts including Render */
-if (!BREVO_API_KEY) {
-  console.warn("⚠️  [MAIL] BREVO_API_KEY not set — emails disabled");
-} else {
-  console.log("✅ [MAIL] Brevo API ready");
-}
-
-async function sendMail({ to, subject, html }) {
-  if (!BREVO_API_KEY) throw new Error("Email service not configured. Set BREVO_API_KEY in ENV.");
-
-  const { data, status } = await axios.post(
-    "https://api.brevo.com/v3/smtp/email",
-    {
-      sender:   { name: "TheNetSMM", email: EMAIL_FROM },
-      to:       [{ email: to }],
-      subject,
-      htmlContent: html,
-    },
-    {
-      headers: {
-        "api-key":      BREVO_API_KEY,
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-      },
-      timeout: 15000,
-    }
-  );
-
-  console.log(`✅ [MAIL] Sent → ${to} | msgId: ${data.messageId}`);
-  return data;
-}
-
-/* ── Email templates ──────────────────────────────────── */
-/* ── Email templates ──────────────────────────────────────*/
-function tplVerify(link) {
-  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
-    <h2 style="color:#5B1AB0">TheNetSMM</h2>
-    <p>Hello,</p>
-    <p>Thank you for registering an account with thenetsmm.com. To complete your registration and verify your email address, please click the button below:</p>
-    <p style="text-align:center;margin:30px 0">
-      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Confirm Account</a>
-    </p>
-    <p>If you did not create an account, you can safely ignore this email.</p>
-    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
-  </div>`;
-}
-
-function tplReset(link) {
-  return `<div style="font-family:Arial,sans-serif;max-width:540px;margin:auto;padding:30px">
-    <h2 style="color:#5B1AB0">TheNetSMM</h2>
-    <p>Hello,</p>
-    <p>You requested a password change. To proceed, click the button below:</p>
-    <p style="text-align:center;margin:30px 0">
-      <a href="${link}" style="background:linear-gradient(90deg,#7B3FBF,#E91E8C);color:#fff;padding:14px 32px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:15px">Reset Password</a>
-    </p>
-    <p>If you did not request it, you can safely ignore this message. Only a person with access to your email, can reset your password.</p>
-    <br><p>Best regards,<br><strong>thenetsmm.com team</strong></p>
-  </div>`;
-}
 
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
@@ -157,6 +85,7 @@ app.use(cors({
 
 // ── Body parsing & NoSQL injection prevention ─────────────
 app.use(express.json({ limit: "2mb" }));
+app.use(cookieParser());
 app.use(mongoSanitize({             // strip $ and . from user input
   replaceWith: "_",
   onSanitize: ({ req, key }) => {
@@ -206,25 +135,22 @@ const userSchema = new mongoose.Schema({
   balanceSpent:  { type: Number, default: 0 },
   totalOrders:   { type: Number, default: 0 },
   isAdmin:       { type: Boolean, default: false },
-  loginAttempts: { type: Number, default: 0 },
-  lockUntil:     { type: Date,   default: null },
-
-  // ── Email Verification ──────────────────────────────
+  loginAttempts:            { type: Number,  default: 0 },
+  lockUntil:                { type: Date,    default: null },
   isVerified:               { type: Boolean, default: false },
   verificationToken:        { type: String,  default: null },
   verificationTokenExpires: { type: Date,    default: null },
-
-  // ── Password Reset ──────────────────────────────────
-  resetPasswordToken:   { type: String, default: null },
-  resetPasswordExpires: { type: Date,   default: null },
-
+  resetPasswordToken:       { type: String,  default: null },
+  resetPasswordExpires:     { type: Date,    default: null },
+  backupCodes: [{
+    codeHash: { type: String, required: true },
+    used:     { type: Boolean, default: false },
+  }],
 }, { timestamps: true });
 
 // ── Performance indexes ────────────────────────────────
 userSchema.index({ email: 1 });
 userSchema.index({ name:  1 });
-userSchema.index({ verificationToken:  1 }, { sparse: true });
-userSchema.index({ resetPasswordToken: 1 }, { sparse: true });
 
 const User = mongoose.model("User", userSchema);
 
@@ -268,6 +194,21 @@ const Order = mongoose.model("Order", orderSchema);
 ══════════════════════════════════════════════════════════ */
 const makeToken = (id) => jwt.sign({ id }, JWT_SECRET, { expiresIn: "7d" });
 
+/* Set JWT as HttpOnly Secure cookie (XSS-safe) */
+const COOKIE_OPTS = {
+  httpOnly: true,                              // JS cannot read it
+  secure:   process.env.NODE_ENV === "production", // HTTPS only in prod
+  sameSite: "strict",                          // CSRF protection
+  maxAge:   7 * 24 * 60 * 60 * 1000,         // 7 days in ms
+  path:     "/",
+};
+
+function setAuthCookie(res, userId) {
+  const token = makeToken(userId);
+  res.cookie("smm_token", token, COOKIE_OPTS);
+  return token; // still returned for localStorage fallback
+}
+
 const safeUser = (u) => ({
   id:           u._id,
   name:         sanitizeStr(u.name),
@@ -294,20 +235,55 @@ const normEmail = (e) => String(e || "").toLowerCase().trim();
 const isEmail   = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const isMongoId = (id) => /^[0-9a-fA-F]{24}$/.test(String(id || ""));
 
+/* ── Backup code helpers ───────────────────────────────────
+   Generates 8 cryptographically-random 8-char alphanumeric codes.
+   Returns { plainCodes, hashedCodes } — store hashes, show plain. */
+async function generateBackupCodes() {
+  const chars     = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I/O/0/1
+  const plainCodes  = [];
+  const hashedCodes = [];
+  for (let i = 0; i < 8; i++) {
+    let code = "";
+    const bytes = crypto.randomBytes(8);
+    for (const b of bytes) code += chars[b % chars.length];
+    const formatted = code.slice(0, 4) + "-" + code.slice(4); // XXXX-XXXX
+    plainCodes.push(formatted);
+    hashedCodes.push({
+      codeHash: await bcrypt.hash(formatted, 8), // rounds=8: fast enough
+      used: false,
+    });
+  }
+  return { plainCodes, hashedCodes };
+}
+
+/* Verify backup code against stored hashes (first unused match) */
+async function verifyBackupCode(plainCode, storedCodes) {
+  for (const entry of storedCodes) {
+    if (entry.used) continue;
+    const match = await bcrypt.compare(plainCode.toUpperCase(), entry.codeHash);
+    if (match) return entry;
+  }
+  return null;
+}
+
 /* ── Auth middleware ─────────────────────────────────────*/
 function guard(req, res, next) {
   try {
-    const authHeader = req.headers["authorization"] || "";
-    if (!authHeader) return res.status(401).json({ message: "Authorization header missing" });
-    const parts = authHeader.trim().split(/\s+/);
-    const token = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : parts[0];
-    if (!token) return res.status(401).json({ message: "Token not provided" });
+    // 1. HttpOnly cookie (primary — XSS-safe)
+    // 2. Authorization header (fallback for API/mobile clients)
+    let token = req.cookies?.smm_token;
+    if (!token) {
+      const h = req.headers["authorization"] || "";
+      const p = h.trim().split(/\s+/);
+      token = (p.length === 2 && p[0].toLowerCase() === "bearer") ? p[1] : p[0];
+    }
+    if (!token) return res.status(401).json({ message: "Not authenticated" });
     req.uid = jwt.verify(token, JWT_SECRET).id;
     next();
   } catch (err) {
     if (err.name === "TokenExpiredError")
-      return res.status(401).json({ message: "Token expired, please log in again" });
-    return res.status(401).json({ message: "Invalid token, please log in again" });
+      return res.status(401).json({ message: "Session expired. Please log in again." });
+    return res.status(401).json({ message: "Invalid session. Please log in again." });
   }
 }
 
@@ -382,7 +358,10 @@ async function japAPI(params, _retry = false) {
   // ── Log request ─────────────────────────────────────────
   console.log("━━━ [JAP] REQUEST ━━━");
   console.log("URL     :", JAP_API_URL);
-  console.log("Payload :", Object.fromEntries(payload));
+  // Mask API key in logs to prevent credential exposure
+  const logPayload = Object.fromEntries(payload);
+  if (logPayload.key) logPayload.key = logPayload.key.slice(0,6) + "••••••••[REDACTED]";
+  console.log("Payload :", logPayload);
 
   try {
     const { status, data } = await axios.post(
@@ -455,78 +434,25 @@ app.post("/api/auth/signup", authLimiter, async (req, res) => {
     const email = normEmail(req.body.email);
     if (!name || !email || !password)
       return res.status(400).json({ message: "Please fill in all fields" });
-    if (!isEmail(email))
-      return res.status(400).json({ message: "Invalid email format" });
     if (password.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     if (await User.findOne({ email }))
       return res.status(400).json({ message: "An account with this email already exists" });
-
-    // ── Generate verification token (raw → send, hashed → store)
-    const rawToken    = crypto.randomBytes(32).toString("hex");
-    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
-    const expires     = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
+    const { plainCodes, hashedCodes } = await generateBackupCodes();
     const user = await User.create({
       name, email,
-      password:                await bcrypt.hash(password, 10),
-      isVerified:              false,
-      verificationToken:       hashedToken,
-      verificationTokenExpires: expires,
+      password:    await bcrypt.hash(password, 10),
+      backupCodes: hashedCodes,
     });
 
-    // ── Send verification email ───────────────────────────
-    const link = `${FRONTEND_URL}/verify-email?token=${rawToken}`;
-    try {
-      await sendMail({
-        to:      email,
-        subject: "Confirm your TheNetSMM account",
-        html:    tplVerify(link),
-      });
-      console.log(`[SIGNUP] Verification email sent to ${email}`);
-    } catch (mailErr) {
-      // Delete user if email fails — avoid unverified zombie accounts
-      await User.findByIdAndDelete(user._id);
-      console.error("[SIGNUP] Email failed:", mailErr.message);
-      return res.status(500).json({ message: "Could not send verification email. Please try again." });
-    }
-
+    // Return backup codes ONCE — never shown again
     res.status(201).json({
-      message: "Account created! Please check your email and click the confirmation link to activate your account.",
+      message:     "Account created successfully",
+      token:       makeToken(user._id),
+      user:        safeUser(user),
+      backupCodes: plainCodes,  // XXXX-XXXX format, 8 codes
     });
-  } catch (e) {
-    console.error("[SIGNUP ERR]", e.message);
-    res.status(500).json({ message: "Server error. Please try again." });
-  }
-});
-
-/* ── GET /api/auth/verify-email?token=<rawToken>
-   Frontend calls this after user clicks email link          */
-app.get("/api/auth/verify-email", async (req, res) => {
-  try {
-    const { token } = req.query;
-    if (!token) return res.status(400).json({ message: "Verification token is required" });
-
-    const hashedToken = crypto.createHash("sha256").update(String(token)).digest("hex");
-    const user = await User.findOne({
-      verificationToken:        hashedToken,
-      verificationTokenExpires: { $gt: Date.now() },
-    });
-
-    if (!user) return res.status(400).json({ message: "Token is invalid or has expired. Please register again." });
-    if (user.isVerified) return res.json({ message: "Email already verified. You can log in." });
-
-    user.isVerified              = true;
-    user.verificationToken       = undefined;
-    user.verificationTokenExpires = undefined;
-    await user.save();
-
-    console.log(`[VERIFY] Email verified: ${user.email}`);
-    res.json({ message: "Email verified! Your account is now active. You can log in." });
-  } catch (e) {
-    console.error("[VERIFY ERR]", e.message);
-    res.status(500).json({ message: "Verification failed. Please try again." });
-  }
+  } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
 });
 
 app.post("/api/auth/login", authLimiter, async (req, res) => {
@@ -550,13 +476,6 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     }
 
     const valid = user && await bcrypt.compare(password, user.password);
-
-    // ── Email verification check ──────────────────────────
-    if (valid && user && !user.isVerified) {
-      return res.status(403).json({
-        message: "Please verify your email before logging in. Check your inbox for the confirmation link.",
-      });
-    }
 
     if (!valid) {
       // Increment failed attempts
@@ -587,84 +506,64 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   }
 });
 
-/* ── POST /api/auth/forgot-password
-   Step 1: User submits email → send reset link              */
-app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
-  try {
-    const email = normEmail(req.body.email);
-    if (!email || !isEmail(email))
-      return res.status(400).json({ message: "Valid email is required" });
-
-    const user = await User.findOne({ email });
-
-    // Always reply success — prevents email enumeration attacks
-    const genericMsg = "If that email exists in our system, a password reset link has been sent.";
-
-    if (!user) return res.json({ message: genericMsg });
-    if (!user.isVerified) return res.json({ message: genericMsg }); // don't reveal why
-
-    const rawToken    = crypto.randomBytes(32).toString("hex");
-    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
-    const expires     = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
-    user.resetPasswordToken   = hashedToken;
-    user.resetPasswordExpires = expires;
-    await user.save();
-
-    const link = `${FRONTEND_URL}/reset-password?token=${rawToken}`;
-    try {
-      await sendMail({
-        to:      email,
-        subject: "Reset your TheNetSMM password",
-        html:    tplReset(link),
-      });
-      console.log(`[FORGOT] Reset email sent to ${email}`);
-    } catch (mailErr) {
-      console.error("[FORGOT] Email failed:", mailErr.message);
-      console.error("[FORGOT] BREVO_API_KEY set:", !!BREVO_API_KEY);
-      return res.status(500).json({
-        message: "Could not send reset email: " + mailErr.message + ". Check server EMAIL configuration.",
-      });
-    }
-
-    res.json({ message: genericMsg });
-  } catch (e) {
-    console.error("[FORGOT ERR]", e.message);
-    res.status(500).json({ message: "Server error. Please try again." });
-  }
-});
-
-/* ── POST /api/auth/reset-password
-   Step 2: User submits new password + token from email link */
+/* POST /api/auth/reset-password
+   Requires email + backupCode (one-time use) + newPassword  */
 app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
   try {
-    const { token, newPassword } = req.body;
-    if (!token || !newPassword)
-      return res.status(400).json({ message: "Token and new password are required" });
+    const { backupCode, newPassword } = req.body;
+    const email = normEmail(req.body.email);
+
+    if (!email || !backupCode || !newPassword)
+      return res.status(400).json({ message: "Email, backup code and new password are required" });
     if (newPassword.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
 
-    const hashedToken = crypto.createHash("sha256").update(String(token)).digest("hex");
-    const user = await User.findOne({
-      resetPasswordToken:   hashedToken,
-      resetPasswordExpires: { $gt: Date.now() },
-    });
+    const user = await User.findOne({ email }).select("+backupCodes");
+    if (!user)
+      return res.status(400).json({ message: "Invalid email or backup code" }); // generic
 
-    if (!user) return res.status(400).json({ message: "Reset token is invalid or has expired. Please request a new one." });
+    // Verify backup code against stored hashes
+    const matched = await verifyBackupCode(backupCode.trim().toUpperCase(), user.backupCodes || []);
+    if (!matched)
+      return res.status(400).json({ message: "Invalid or already-used backup code" });
 
-    user.password             = await bcrypt.hash(newPassword, 10);
-    user.resetPasswordToken   = undefined;
-    user.resetPasswordExpires = undefined;
-    user.loginAttempts        = 0;    // clear any lockout
-    user.lockUntil            = null;
+    // Mark this code as used (single-use)
+    matched.used = true;
+
+    // Update password + save used-code state atomically
+    user.password      = await bcrypt.hash(newPassword, 10);
+    user.loginAttempts = 0;
+    user.lockUntil     = null;
     await user.save();
 
-    console.log(`[RESET] Password reset: ${user.email}`);
-    res.json({ message: "Password reset successfully! You can now log in with your new password." });
+    console.log(`[RESET] Password reset via backup code: ${user.email}`);
+    res.json({ message: "Password reset successfully. You can now log in." });
   } catch (e) {
     console.error("[RESET ERR]", e.message);
     res.status(500).json({ message: "Server error. Please try again." });
   }
+});
+
+/* POST /api/auth/backup-codes/regenerate
+   Logged-in user regenerates all backup codes (invalidates old ones) */
+app.post("/api/auth/backup-codes/regenerate", guard, async (req, res) => {
+  try {
+    const { plainCodes, hashedCodes } = await generateBackupCodes();
+    await User.findByIdAndUpdate(req.uid, { backupCodes: hashedCodes });
+    console.log(`[BACKUP] Codes regenerated for user ${req.uid}`);
+    res.json({
+      message:     "New backup codes generated. Old codes are now invalid.",
+      backupCodes: plainCodes,
+    });
+  } catch (e) {
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+/* POST /api/auth/logout — clear HttpOnly cookie */
+app.post("/api/auth/logout", (req, res) => {
+  res.clearCookie("smm_token", { path: "/", httpOnly: true, secure: true, sameSite: "strict" });
+  res.json({ message: "Logged out successfully" });
 });
 
 app.get("/api/auth/me", guard, async (req, res) => {
