@@ -1,8 +1,24 @@
+function guard(req, res, next) {
+  try {
+    const cookieToken = req.cookies && req.cookies.smm_token;
+    const authHeader  = req.headers["authorization"] || "";
+    const parts       = authHeader.trim().split(/\s+/);
+    const headerToken = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : (parts.length === 1 ? parts[0] : "");
+    const token       = cookieToken || headerToken;
+
+    if (!token) return res.status(401).json({ message: "Not authenticated. Please log in." });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.uid = decoded.id;
+    next();
+  } catch (err) {
+    if (err.name === "TokenExpiredError")
+      return res.status(401).json({ message: "Session expired. Please log in again." });
+    return res.status(401).json({ message: "Invalid session. Please log in again." });
+  }
+}
+
 "use strict";
 require("dotenv").config();
-
-// Explicit import to avoid conflict with Node.js v21+ global WebCrypto
-const nodeCrypto = require("crypto");
 
 const express      = require("express");
 const cors         = require("cors");
@@ -14,7 +30,6 @@ const multer       = require("multer");
 const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
-const cookieParser  = require("cookie-parser");
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -45,9 +60,6 @@ if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
 if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
-
-// Required for Render/Heroku — enables correct IP detection behind proxy
-app.set('trust proxy', 1);
 
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
@@ -91,7 +103,6 @@ app.use(cors({
 
 // ── Body parsing & NoSQL injection prevention ─────────────
 app.use(express.json({ limit: "2mb" }));
-app.use(cookieParser());
 app.use(mongoSanitize({             // strip $ and . from user input
   replaceWith: "_",
   onSanitize: ({ req, key }) => {
@@ -141,17 +152,12 @@ const userSchema = new mongoose.Schema({
   balanceSpent:  { type: Number, default: 0 },
   totalOrders:   { type: Number, default: 0 },
   isAdmin:       { type: Boolean, default: false },
-  loginAttempts:            { type: Number,  default: 0 },
-  lockUntil:                { type: Date,    default: null },
-  isVerified:               { type: Boolean, default: false },
-  verificationToken:        { type: String,  default: null },
-  verificationTokenExpires: { type: Date,    default: null },
-  resetPasswordToken:       { type: String,  default: null },
-  resetPasswordExpires:     { type: Date,    default: null },
-  backupCodes: [{
-    codeHash: { type: String, required: true },
-    used:     { type: Boolean, default: false },
-  }],
+  loginAttempts: { type: Number, default: 0 },
+  backupCodes:   [{                             // ← Backup codes for password reset
+    hash: { type: String, required: true },
+    used: { type: Boolean, default: false },
+  }],          // Brute-force protection
+  lockUntil:     { type: Date,   default: null },        // Account lockout timestamp
 }, { timestamps: true });
 
 // ── Performance indexes ────────────────────────────────
@@ -200,21 +206,6 @@ const Order = mongoose.model("Order", orderSchema);
 ══════════════════════════════════════════════════════════ */
 const makeToken = (id) => jwt.sign({ id }, JWT_SECRET, { expiresIn: "7d" });
 
-/* Set JWT as HttpOnly Secure cookie (XSS-safe) */
-const COOKIE_OPTS = {
-  httpOnly: true,                              // JS cannot read it
-  secure:   process.env.NODE_ENV === "production", // HTTPS only in prod
-  sameSite: "strict",                          // CSRF protection
-  maxAge:   7 * 24 * 60 * 60 * 1000,         // 7 days in ms
-  path:     "/",
-};
-
-function setAuthCookie(res, userId) {
-  const token = makeToken(userId);
-  res.cookie("smm_token", token, COOKIE_OPTS);
-  return token; // still returned for localStorage fallback
-}
-
 const safeUser = (u) => ({
   id:           u._id,
   name:         sanitizeStr(u.name),
@@ -241,55 +232,43 @@ const normEmail = (e) => String(e || "").toLowerCase().trim();
 const isEmail   = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const isMongoId = (id) => /^[0-9a-fA-F]{24}$/.test(String(id || ""));
 
-/* ── Backup code helpers ───────────────────────────────────
-   Generates 8 cryptographically-random 8-char alphanumeric codes.
-   Returns { plainCodes, hashedCodes } — store hashes, show plain. */
-async function generateBackupCodes() {
-  const chars     = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I/O/0/1
-  const plainCodes  = [];
-  const hashedCodes = [];
-  for (let i = 0; i < 8; i++) {
-    let code = "";
-    const bytes = nodeCrypto.randomBytes(8);
-    for (const b of bytes) code += chars[b % chars.length];
-    const formatted = code.slice(0, 4) + "-" + code.slice(4); // XXXX-XXXX
-    plainCodes.push(formatted);
-    hashedCodes.push({
-      codeHash: await bcrypt.hash(formatted, 8), // rounds=8: fast enough
-      used: false,
-    });
-  }
-  return { plainCodes, hashedCodes };
+
+/* ── Set JWT as HttpOnly cookie (XSS-safe) ──────────────*/
+function setAuthCookie(res, token) {
+  res.cookie("smm_token", token, {
+    httpOnly: true,                                     // JS cannot read this cookie
+    secure:   process.env.NODE_ENV === "production",    // HTTPS only in prod
+    sameSite: "none",                                   // Cross-origin (Vercel ↔ Render)
+    maxAge:   7 * 24 * 60 * 60 * 1000,                 // 7 days
+  });
 }
 
-/* Verify backup code against stored hashes (first unused match) */
-async function verifyBackupCode(plainCode, storedCodes) {
-  for (const entry of storedCodes) {
-    if (entry.used) continue;
-    const match = await bcrypt.compare(plainCode.toUpperCase(), entry.codeHash);
-    if (match) return entry;
-  }
-  return null;
+/* ── Generate 8 backup codes ─────────────────────────── */
+async function generateBackupCodes() {
+  const raw = Array.from({ length: 8 }, () =>
+    crypto.randomBytes(5).toString("hex").toUpperCase()  // e.g. "A3F9B2C1D4"
+  );
+  const hashed = await Promise.all(raw.map(c => bcrypt.hash(c, 10)));
+  return {
+    raw,                                               // show to user once
+    stored: hashed.map(hash => ({ hash, used: false })),
+  };
 }
 
 /* ── Auth middleware ─────────────────────────────────────*/
 function guard(req, res, next) {
   try {
-    // 1. HttpOnly cookie (primary — XSS-safe)
-    // 2. Authorization header (fallback for API/mobile clients)
-    let token = req.cookies?.smm_token;
-    if (!token) {
-      const h = req.headers["authorization"] || "";
-      const p = h.trim().split(/\s+/);
-      token = (p.length === 2 && p[0].toLowerCase() === "bearer") ? p[1] : p[0];
-    }
-    if (!token) return res.status(401).json({ message: "Not authenticated" });
+    const authHeader = req.headers["authorization"] || "";
+    if (!authHeader) return res.status(401).json({ message: "Authorization header missing" });
+    const parts = authHeader.trim().split(/\s+/);
+    const token = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : parts[0];
+    if (!token) return res.status(401).json({ message: "Token not provided" });
     req.uid = jwt.verify(token, JWT_SECRET).id;
     next();
   } catch (err) {
     if (err.name === "TokenExpiredError")
-      return res.status(401).json({ message: "Session expired. Please log in again." });
-    return res.status(401).json({ message: "Invalid session. Please log in again." });
+      return res.status(401).json({ message: "Token expired, please log in again" });
+    return res.status(401).json({ message: "Invalid token, please log in again" });
   }
 }
 
@@ -364,10 +343,7 @@ async function japAPI(params, _retry = false) {
   // ── Log request ─────────────────────────────────────────
   console.log("━━━ [JAP] REQUEST ━━━");
   console.log("URL     :", JAP_API_URL);
-  // Mask API key in logs to prevent credential exposure
-  const logPayload = Object.fromEntries(payload);
-  if (logPayload.key) logPayload.key = logPayload.key.slice(0,6) + "••••••••[REDACTED]";
-  console.log("Payload :", logPayload);
+  console.log("Payload :", Object.fromEntries(payload));
 
   try {
     const { status, data } = await axios.post(
@@ -444,19 +420,19 @@ app.post("/api/auth/signup", authLimiter, async (req, res) => {
       return res.status(400).json({ message: "Password must be at least 6 characters" });
     if (await User.findOne({ email }))
       return res.status(400).json({ message: "An account with this email already exists" });
-    const { plainCodes, hashedCodes } = await generateBackupCodes();
+    const { raw: backupCodesRaw, stored: backupCodesStored } = await generateBackupCodes();
     const user = await User.create({
       name, email,
       password:    await bcrypt.hash(password, 10),
-      backupCodes: hashedCodes,
+      backupCodes: backupCodesStored,
     });
-
-    // Return backup codes ONCE — never shown again
+    const token = makeToken(user._id);
+    setAuthCookie(res, token);
+    console.log(`[SIGNUP] New user: ${email} — backup codes generated`);
     res.status(201).json({
-      message:     "Account created successfully",
-      token:       makeToken(user._id),
+      message:     "Account created successfully!",
       user:        safeUser(user),
-      backupCodes: plainCodes,  // XXXX-XXXX format, 8 codes
+      backupCodes: backupCodesRaw,   // ← shown ONCE, never stored in plain text
     });
   } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
 });
@@ -505,70 +481,79 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     }
 
     console.log(`[AUTH] Login: ${user.email} from ${req.ip}`);
-    res.json({ message: "Login successful", token: makeToken(user._id), user: safeUser(user) });
+    const token = makeToken(user._id);
+    setAuthCookie(res, token);
+    res.json({ message: "Login successful", user: safeUser(user) });
   } catch (e) {
     console.error("[LOGIN ERR]", e.message);
     res.status(500).json({ message: "Server error. Please try again." });
   }
 });
 
-/* POST /api/auth/reset-password
-   Requires email + backupCode (one-time use) + newPassword  */
 app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
   try {
-    const { backupCode, newPassword } = req.body;
+    const { newPassword, backupCode } = req.body;
     const email = normEmail(req.body.email);
 
     if (!email || !backupCode || !newPassword)
-      return res.status(400).json({ message: "Email, backup code and new password are required" });
+      return res.status(400).json({ message: "Email, backup code, and new password are required" });
     if (newPassword.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
 
-    const user = await User.findOne({ email }).select("+backupCodes");
-    if (!user)
-      return res.status(400).json({ message: "Invalid email or backup code" }); // generic
+    const user = await User.findOne({ email });
+    // Generic error to prevent email enumeration
+    if (!user) return res.status(400).json({ message: "Invalid email or backup code" });
 
-    // Verify backup code against stored hashes
-    const matched = await verifyBackupCode(backupCode.trim().toUpperCase(), user.backupCodes || []);
-    if (!matched)
-      return res.status(400).json({ message: "Invalid or already-used backup code" });
+    // ── Find a matching unused backup code ────────────────
+    let matchedIndex = -1;
+    const normalizedInput = backupCode.trim().toUpperCase();
+    for (let i = 0; i < user.backupCodes.length; i++) {
+      const entry = user.backupCodes[i];
+      if (!entry.used && await bcrypt.compare(normalizedInput, entry.hash)) {
+        matchedIndex = i;
+        break;
+      }
+    }
+    if (matchedIndex === -1)
+      return res.status(400).json({ message: "Invalid or already used backup code" });
 
-    // Mark this code as used (single-use)
-    matched.used = true;
-
-    // Update password + save used-code state atomically
+    // ── Mark code as used (one-time) ──────────────────────
+    user.backupCodes[matchedIndex].used = true;
     user.password      = await bcrypt.hash(newPassword, 10);
     user.loginAttempts = 0;
     user.lockUntil     = null;
     await user.save();
 
-    console.log(`[RESET] Password reset via backup code: ${user.email}`);
-    res.json({ message: "Password reset successfully. You can now log in." });
+    console.log(`[RESET] Password reset via backup code: ${email} from ${req.ip}`);
+    res.json({ message: "Password reset successfully! You can now log in." });
   } catch (e) {
     console.error("[RESET ERR]", e.message);
     res.status(500).json({ message: "Server error. Please try again." });
   }
 });
 
-/* POST /api/auth/backup-codes/regenerate
-   Logged-in user regenerates all backup codes (invalidates old ones) */
-app.post("/api/auth/backup-codes/regenerate", guard, async (req, res) => {
+/* POST /api/auth/regenerate-backup-codes (authenticated)
+   Generates 8 fresh codes and invalidates all old ones    */
+app.post("/api/auth/regenerate-backup-codes", guard, async (req, res) => {
   try {
-    const { plainCodes, hashedCodes } = await generateBackupCodes();
-    await User.findByIdAndUpdate(req.uid, { backupCodes: hashedCodes });
+    const { raw, stored } = await generateBackupCodes();
+    await User.findByIdAndUpdate(req.uid, { backupCodes: stored });
     console.log(`[BACKUP] Codes regenerated for user ${req.uid}`);
     res.json({
-      message:     "New backup codes generated. Old codes are now invalid.",
-      backupCodes: plainCodes,
+      message:     "New backup codes generated. Save them securely — they won't be shown again!",
+      backupCodes: raw,
     });
   } catch (e) {
-    res.status(500).json({ message: "Server error." });
+    res.status(500).json({ message: "Server error" });
   }
 });
 
+
 /* POST /api/auth/logout — clear HttpOnly cookie */
 app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("smm_token", { path: "/", httpOnly: true, secure: true, sameSite: "strict" });
+  res.clearCookie("smm_token", {
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "none",
+  });
   res.json({ message: "Logged out successfully" });
 });
 
