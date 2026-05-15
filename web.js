@@ -1,22 +1,3 @@
-function guard(req, res, next) {
-  try {
-    const cookieToken = req.cookies && req.cookies.smm_token;
-    const authHeader  = req.headers["authorization"] || "";
-    const parts       = authHeader.trim().split(/\s+/);
-    const headerToken = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : (parts.length === 1 ? parts[0] : "");
-    const token       = cookieToken || headerToken;
-
-    if (!token) return res.status(401).json({ message: "Not authenticated. Please log in." });
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.uid = decoded.id;
-    next();
-  } catch (err) {
-    if (err.name === "TokenExpiredError")
-      return res.status(401).json({ message: "Session expired. Please log in again." });
-    return res.status(401).json({ message: "Invalid session. Please log in again." });
-  }
-}
-
 "use strict";
 require("dotenv").config();
 
@@ -60,6 +41,8 @@ if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
 if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
+app.set('trust proxy', 1);          // Required for Render proxy
+app.use(cookieParser());             // Parse HttpOnly JWT cookie
 
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
@@ -152,12 +135,12 @@ const userSchema = new mongoose.Schema({
   balanceSpent:  { type: Number, default: 0 },
   totalOrders:   { type: Number, default: 0 },
   isAdmin:       { type: Boolean, default: false },
-  loginAttempts: { type: Number, default: 0 },
-  backupCodes:   [{                             // ← Backup codes for password reset
+  loginAttempts: { type: Number, default: 0 },          // Brute-force protection
+  lockUntil:     { type: Date,   default: null },        // Account lockout timestamp
+  backupCodes:   [{
     hash: { type: String, required: true },
     used: { type: Boolean, default: false },
-  }],          // Brute-force protection
-  lockUntil:     { type: Date,   default: null },        // Account lockout timestamp
+  }],
 }, { timestamps: true });
 
 // ── Performance indexes ────────────────────────────────
@@ -233,24 +216,25 @@ const isEmail   = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const isMongoId = (id) => /^[0-9a-fA-F]{24}$/.test(String(id || ""));
 
 
-/* ── Set JWT as HttpOnly cookie (XSS-safe) ──────────────*/
+/* ── Set JWT as HttpOnly cookie ─────────────────────────*/
 function setAuthCookie(res, token) {
   res.cookie("smm_token", token, {
-    httpOnly: true,                                     // JS cannot read this cookie
-    secure:   process.env.NODE_ENV === "production",    // HTTPS only in prod
-    sameSite: "none",                                   // Cross-origin (Vercel ↔ Render)
-    maxAge:   7 * 24 * 60 * 60 * 1000,                 // 7 days
+    httpOnly: true,
+    secure:   process.env.NODE_ENV === "production",
+    sameSite: "none",
+    maxAge:   7 * 24 * 60 * 60 * 1000,
   });
 }
 
-/* ── Generate 8 backup codes ─────────────────────────── */
+/* ── Generate 8 one-time backup codes ───────────────────*/
 async function generateBackupCodes() {
+  const nodeCrypto = require("crypto");
   const raw = Array.from({ length: 8 }, () =>
-    crypto.randomBytes(5).toString("hex").toUpperCase()  // e.g. "A3F9B2C1D4"
+    nodeCrypto.randomBytes(5).toString("hex").toUpperCase()
   );
   const hashed = await Promise.all(raw.map(c => bcrypt.hash(c, 10)));
   return {
-    raw,                                               // show to user once
+    raw,
     stored: hashed.map(hash => ({ hash, used: false })),
   };
 }
@@ -258,17 +242,19 @@ async function generateBackupCodes() {
 /* ── Auth middleware ─────────────────────────────────────*/
 function guard(req, res, next) {
   try {
-    const authHeader = req.headers["authorization"] || "";
-    if (!authHeader) return res.status(401).json({ message: "Authorization header missing" });
-    const parts = authHeader.trim().split(/\s+/);
-    const token = (parts.length === 2 && parts[0].toLowerCase() === "bearer") ? parts[1] : parts[0];
-    if (!token) return res.status(401).json({ message: "Token not provided" });
+    const cookieToken = req.cookies && req.cookies.smm_token;
+    const authHeader  = req.headers["authorization"] || "";
+    const parts       = authHeader.trim().split(/\s+/);
+    const headerToken = (parts.length === 2 && parts[0].toLowerCase() === "bearer")
+      ? parts[1] : (parts.length === 1 && parts[0] !== "bearer" ? parts[0] : "");
+    const token = cookieToken || headerToken;
+    if (!token) return res.status(401).json({ message: "Not authenticated. Please log in." });
     req.uid = jwt.verify(token, JWT_SECRET).id;
     next();
   } catch (err) {
     if (err.name === "TokenExpiredError")
-      return res.status(401).json({ message: "Token expired, please log in again" });
-    return res.status(401).json({ message: "Invalid token, please log in again" });
+      return res.status(401).json({ message: "Session expired. Please log in again." });
+    return res.status(401).json({ message: "Invalid session. Please log in again." });
   }
 }
 
@@ -428,11 +414,10 @@ app.post("/api/auth/signup", authLimiter, async (req, res) => {
     });
     const token = makeToken(user._id);
     setAuthCookie(res, token);
-    console.log(`[SIGNUP] New user: ${email} — backup codes generated`);
     res.status(201).json({
-      message:     "Account created successfully!",
+      message:     "Account created! Save your backup codes.",
       user:        safeUser(user),
-      backupCodes: backupCodesRaw,   // ← shown ONCE, never stored in plain text
+      backupCodes: backupCodesRaw,
     });
   } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
 });
@@ -494,37 +479,32 @@ app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
   try {
     const { newPassword, backupCode } = req.body;
     const email = normEmail(req.body.email);
-
     if (!email || !backupCode || !newPassword)
       return res.status(400).json({ message: "Email, backup code, and new password are required" });
     if (newPassword.length < 6)
       return res.status(400).json({ message: "Password must be at least 6 characters" });
 
     const user = await User.findOne({ email });
-    // Generic error to prevent email enumeration
     if (!user) return res.status(400).json({ message: "Invalid email or backup code" });
 
-    // ── Find a matching unused backup code ────────────────
     let matchedIndex = -1;
     const normalizedInput = backupCode.trim().toUpperCase();
-    for (let i = 0; i < user.backupCodes.length; i++) {
+    for (let i = 0; i < (user.backupCodes || []).length; i++) {
       const entry = user.backupCodes[i];
       if (!entry.used && await bcrypt.compare(normalizedInput, entry.hash)) {
-        matchedIndex = i;
-        break;
+        matchedIndex = i; break;
       }
     }
     if (matchedIndex === -1)
       return res.status(400).json({ message: "Invalid or already used backup code" });
 
-    // ── Mark code as used (one-time) ──────────────────────
     user.backupCodes[matchedIndex].used = true;
     user.password      = await bcrypt.hash(newPassword, 10);
     user.loginAttempts = 0;
     user.lockUntil     = null;
     await user.save();
 
-    console.log(`[RESET] Password reset via backup code: ${email} from ${req.ip}`);
+    console.log(`[RESET] Password reset via backup code: ${email}`);
     res.json({ message: "Password reset successfully! You can now log in." });
   } catch (e) {
     console.error("[RESET ERR]", e.message);
@@ -532,29 +512,17 @@ app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
   }
 });
 
-/* POST /api/auth/regenerate-backup-codes (authenticated)
-   Generates 8 fresh codes and invalidates all old ones    */
 app.post("/api/auth/regenerate-backup-codes", guard, async (req, res) => {
   try {
     const { raw, stored } = await generateBackupCodes();
     await User.findByIdAndUpdate(req.uid, { backupCodes: stored });
-    console.log(`[BACKUP] Codes regenerated for user ${req.uid}`);
-    res.json({
-      message:     "New backup codes generated. Save them securely — they won't be shown again!",
-      backupCodes: raw,
-    });
-  } catch (e) {
-    res.status(500).json({ message: "Server error" });
-  }
+    res.json({ message: "New backup codes generated!", backupCodes: raw });
+  } catch (e) { res.status(500).json({ message: "Server error" }); }
 });
 
-
-/* POST /api/auth/logout — clear HttpOnly cookie */
 app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("smm_token", {
-    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "none",
-  });
-  res.json({ message: "Logged out successfully" });
+  res.clearCookie("smm_token", { httpOnly:true, secure:process.env.NODE_ENV==="production", sameSite:"none" });
+  res.json({ message: "Logged out" });
 });
 
 app.get("/api/auth/me", guard, async (req, res) => {
