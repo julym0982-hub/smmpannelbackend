@@ -145,8 +145,8 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // ── Performance indexes ────────────────────────────────
-userSchema.index({ email: 1 });
-userSchema.index({ name:  1 });
+// email index already created by unique:true in schema
+userSchema.index({ name: 1 });
 
 const User = mongoose.model("User", userSchema);
 
