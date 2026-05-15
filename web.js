@@ -219,10 +219,11 @@ const isMongoId = (id) => /^[0-9a-fA-F]{24}$/.test(String(id || ""));
 
 /* ── Set JWT as HttpOnly cookie ─────────────────────────*/
 function setAuthCookie(res, token) {
+  const prod = process.env.NODE_ENV === "production";
   res.cookie("smm_token", token, {
     httpOnly: true,
-    secure:   process.env.NODE_ENV === "production",
-    sameSite: "none",
+    secure:   prod,                       // SameSite=none requires secure=true
+    sameSite: prod ? "none" : "lax",     // cross-origin prod / lax localhost
     maxAge:   7 * 24 * 60 * 60 * 1000,
   });
 }
@@ -521,7 +522,8 @@ app.post("/api/auth/regenerate-backup-codes", guard, async (req, res) => {
 });
 
 app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("smm_token", { httpOnly:true, secure:process.env.NODE_ENV==="production", sameSite:"none" });
+  const _p = process.env.NODE_ENV === "production";
+  res.clearCookie("smm_token", { httpOnly:true, secure:_p, sameSite:_p?"none":"lax" });
   res.json({ message: "Logged out" });
 });
 
@@ -561,7 +563,7 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
  */
 let _svcCache = null, _svcCachedAt = 0;
 
-app.get("/api/provider/services", guard, async (req, res) => {
+app.get("/api/provider/services", async (req, res) => {  // public — no guard needed
   try {
     const now = Date.now();
     if (_svcCache && (now - _svcCachedAt) < 10 * 60 * 1000 && req.query.refresh !== "1")
