@@ -1,6 +1,9 @@
 "use strict";
 require("dotenv").config();
 
+// Explicit import to avoid conflict with Node.js v21+ global WebCrypto
+const nodeCrypto = require("crypto");
+
 const express      = require("express");
 const cors         = require("cors");
 const mongoose     = require("mongoose");
@@ -42,6 +45,9 @@ if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
 if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
+
+// Required for Render/Heroku — enables correct IP detection behind proxy
+app.set('trust proxy', 1);
 
 /* ══════════════════════════════════════════════════════════
    SECURITY MIDDLEWARE
@@ -244,7 +250,7 @@ async function generateBackupCodes() {
   const hashedCodes = [];
   for (let i = 0; i < 8; i++) {
     let code = "";
-    const bytes = crypto.randomBytes(8);
+    const bytes = nodeCrypto.randomBytes(8);
     for (const b of bytes) code += chars[b % chars.length];
     const formatted = code.slice(0, 4) + "-" + code.slice(4); // XXXX-XXXX
     plainCodes.push(formatted);
