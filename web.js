@@ -413,11 +413,9 @@ app.post("/api/auth/signup", authLimiter, async (req, res) => {
       password:    await bcrypt.hash(password, 10),
       backupCodes: backupCodesStored,
     });
-    const token = makeToken(user._id);
-    setAuthCookie(res, token);
+    // Do NOT set auth cookie here — user must save backup codes first, then log in manually
     res.status(201).json({
-      message:     "Account created! Save your backup codes.",
-      user:        safeUser(user),
+      message:     "Account created! Save your backup codes before logging in.",
       backupCodes: backupCodesRaw,
     });
   } catch (e) { res.status(500).json({ message: "Server error: " + e.message }); }
