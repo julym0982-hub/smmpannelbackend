@@ -11,6 +11,7 @@ const multer       = require("multer");
 const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
+const cookieParser  = require("cookie-parser");
 
 const upload = multer({
   storage: multer.memoryStorage(),
