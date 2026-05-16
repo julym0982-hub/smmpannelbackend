@@ -378,7 +378,7 @@ async function japAPI(params, _retry = false) {
         return japAPI(params, true);
       }
       const msg = err.response.data?.error || err.response.data?.message || `HTTP ${err.response.status}`;
-      throw new Error("[JAP] " + msg);
+      throw new Error(msg);
     }
     if (err.request) {
       if (!_retry) {
@@ -386,10 +386,10 @@ async function japAPI(params, _retry = false) {
         await new Promise(r => setTimeout(r, 1000));
         return japAPI(params, true);
       }
-      throw new Error("[JAP] No response from provider (timeout/network)");
+      throw new Error("Provider နှင့် ဆက်သွယ်မရပါ — ကြိုးစားမှု၌ retry ပြုလုပ်ပါ");
     }
     if (err.message.startsWith("[JAP]")) throw err;
-    throw new Error("[JAP] " + err.message);
+    throw new Error(err.message.replace(/\[JAP\]\s*/gi, ""));
   }
 }
 
@@ -901,9 +901,8 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
       console.warn(`[CANCEL] JAP refused: ${japErrMsg}`);
       return res.status(400).json({
         message: japErrMsg
-          ? `JAP refused cancel: ${japErrMsg}`
-          : "Order cannot be canceled at this time (JAP rejected the request)",
-        providerResponse: japResponse,
+          ? `ငြင်းပယ်မရပါ: ${japErrMsg.replace(/jap/gi,"").trim()}`
+          : "Cancel မလုပ်နိုင်ပါ — Order လုပ်ဆောင်နေဆဲ ဖြစ်သည်",
       });
     }
 
@@ -962,7 +961,7 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
     await session.abortTransaction();
     session.endSession();
     console.error("[CANCEL ERR]", e.message);
-    res.status(500).json({ message: "Cancel failed: " + e.message });
+    res.status(500).json({ message: "Cancel မအောင်မြင်ပါ — " + e.message.replace(/\[JAP\]\s*/gi, "").replace(/JAP/gi, "").trim() });
   }
 });
 
