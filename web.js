@@ -264,10 +264,15 @@ function guard(req, res, next) {
 /* ── Admin guard ──────────────────────────────────────────*/
 async function adminGuard(req, res, next) {
   try {
-    const h = req.headers["authorization"] || "";
-    const parts = h.trim().split(/\s+/);
-    const token = parts.length === 2 && parts[0].toLowerCase() === "bearer" ? parts[1] : parts[0];
-    if (!token) return res.status(401).json({ message: "No token" });
+    // Read JWT from HttpOnly cookie first, then Authorization header as fallback
+    const cookieToken = req.cookies && req.cookies.smm_token;
+    const h           = req.headers["authorization"] || "";
+    const parts       = h.trim().split(/\s+/);
+    const headerToken = parts.length === 2 && parts[0].toLowerCase() === "bearer"
+      ? parts[1] : (parts[0] !== "bearer" ? parts[0] : "");
+    const token = cookieToken || headerToken;
+
+    if (!token) return res.status(401).json({ message: "Not authenticated" });
     req.uid = jwt.verify(token, JWT_SECRET).id;
     const user = await User.findById(req.uid);
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -276,7 +281,7 @@ async function adminGuard(req, res, next) {
     req.adminUser = user;
     next();
   } catch (e) {
-    return res.status(401).json({ message: "Invalid or expired token" });
+    return res.status(401).json({ message: "Session expired. Please log in again." });
   }
 }
 
