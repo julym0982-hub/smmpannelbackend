@@ -12,6 +12,7 @@ const helmet       = require("helmet");
 const rateLimit    = require("express-rate-limit");
 const mongoSanitize = require("express-mongo-sanitize");
 const cookieParser  = require("cookie-parser");
+const cron          = require("node-cron");
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -164,6 +165,26 @@ const fundRequestSchema = new mongoose.Schema({
 fundRequestSchema.index({ userId: 1, createdAt: -1 });
 fundRequestSchema.index({ status: 1 });
 const FundRequest = mongoose.model("FundRequest", fundRequestSchema);
+
+/* ── ServiceCache Schema — stores JAP services in MongoDB ─
+   Lets us serve services INSTANTLY from DB,
+   instead of calling JAP API on every request.            */
+const serviceCacheSchema = new mongoose.Schema({
+  service_id:   { type: String, required: true, unique: true },
+  name:         { type: String, default: "" },
+  type:         { type: String, default: "Default" },
+  category:     { type: String, default: "Other" },
+  rate:         { type: String, default: "0" },
+  min:          { type: String, default: "10" },
+  max:          { type: String, default: "10000000" },
+  refill:       { type: Boolean, default: false },
+  cancel:       { type: Boolean, default: false },
+  average_time: { type: String, default: null },
+}, { timestamps: true });
+serviceCacheSchema.index({ category: 1 });
+const ServiceCache = mongoose.model("ServiceCache", serviceCacheSchema);
+
+
 
 const orderSchema = new mongoose.Schema({
   user:            { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -543,50 +564,85 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
  * [{ service, name, type, category, rate, min, max, refill, cancel }, ...]
  * We normalize and cache 10 mins.
  */
-let _svcCache = null, _svcCachedAt = 0;
+/* ══════════════════════════════════════════════════════════
+   BACKGROUND SYNC — JAP → MongoDB
+   Runs every 1 hour. User never waits for JAP API.
+══════════════════════════════════════════════════════════ */
+let _syncRunning = false;
 
-app.get("/api/provider/services", async (req, res) => {  // public — no guard needed
+async function syncServicesFromJAP() {
+  if (_syncRunning) { console.log("[SYNC] Already running, skipped"); return; }
+  _syncRunning = true;
+  const startAt = Date.now();
+  console.log("[SYNC] Fetching services from provider...");
+
   try {
-    const now = Date.now();
-    if (_svcCache && (now - _svcCachedAt) < 30 * 60 * 1000 && req.query.refresh !== "1")
-      return res.json(_svcCache);
+    const raw  = await japAPI({ action: "services" });
+    const arr  = (Array.isArray(raw) ? raw : Object.values(raw)).map(s => ({
+      service_id:   String(s.service || s.service_id || ""),
+      name:         s.name         || "",
+      type:         s.type         || "Default",
+      category:     s.category     || "Other",
+      rate:         String(s.rate  || "0"),
+      min:          String(s.min   || "10"),
+      max:          String(s.max   || "10000000"),
+      refill:       !!s.refill,
+      cancel:       !!s.cancel,
+      average_time: s.average_time || s.avg_time || null,
+    })).filter(s => s.service_id);
 
-    // Try fresh fetch; if it fails and we have stale cache, serve stale
-    let raw;
-    try {
-      raw = await japAPI({ action: "services" });
-    } catch (fetchErr) {
-      if (_svcCache) {
-        console.warn("[SERVICES] Fresh fetch failed, serving stale cache:", fetchErr.message);
-        return res.json(_svcCache);
-      }
-      throw fetchErr;
+    // Bulk upsert into MongoDB (fast, atomic)
+    const ops = arr.map(s => ({
+      updateOne: {
+        filter:  { service_id: s.service_id },
+        update:  { $set: s },
+        upsert:  true,
+      },
+    }));
+    const result = await ServiceCache.bulkWrite(ops, { ordered: false });
+    const elapsed = ((Date.now() - startAt) / 1000).toFixed(1);
+    console.log(`[SYNC] ✅ ${arr.length} services synced to DB in ${elapsed}s (upserted: ${result.upsertedCount}, modified: ${result.modifiedCount})`);
+
+  } catch (e) {
+    console.error(`[SYNC] ❌ Fetch failed — keeping existing DB data: ${e.message}`);
+    // No action — old DB data remains valid
+  } finally {
+    _syncRunning = false;
+  }
+}
+
+/*
+ * GET /api/provider/services — instant from MongoDB DB cache
+ * Background sync keeps DB fresh every 1 hour
+ */
+app.get("/api/provider/services", async (req, res) => {
+  try {
+    const services = await ServiceCache.find({})
+      .select("-__v -createdAt -updatedAt")
+      .lean();
+
+    if (services.length === 0) {
+      // DB empty (first run) — trigger sync and tell frontend to retry
+      console.log("[SERVICES] DB empty, triggering background sync...");
+      syncServicesFromJAP();    // background, don't await
+      return res.status(202).json({
+        message: "Services ကို ပြင်ဆင်နေပါသည် — ခဏစောင့်ပြီး ပြန်ကြည့်ပါ (30s)",
+        syncing: true,
+        services: [],
+      });
     }
 
-    // JAP always returns Array — normalize to consistent shape
-    const arr = (Array.isArray(raw) ? raw : Object.values(raw)).map(s => ({
-      service_id:   String(s.service || s.service_id || ""),
-      name:         s.name          || "",
-      type:         s.type          || "Default",
-      category:     s.category      || "Other",
-      rate:         s.rate          || "0",
-      min:          String(s.min    || "10"),
-      max:          String(s.max    || "10000000"),
-      refill:       s.refill        || false,
-      cancel:       s.cancel        || false,
-      // average_time — JAP may return this field; pass through if present
-      average_time: s.average_time  || s.avg_time || null,
-    }));
+    // Sort by numeric service_id
+    services.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
+    console.log(`[SERVICES] Served ${services.length} services from DB`);
+    res.json(services);
 
-    arr.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
-    _svcCache = arr; _svcCachedAt = now;
-    console.log(`[SERVICES] ${arr.length} JAP services loaded`);
-    res.json(arr);
   } catch (e) {
     console.error("[SERVICES ERR]", e.message);
-    res.status(502).json({ message: e.message });
+    res.status(500).json({ message: "Services ဆွဲမရပါ — ထပ်ကြိုးစားပါ" });
   }
 });
+
 
 /*
  * GET /api/provider/balance
@@ -1130,8 +1186,27 @@ app.use((err, req, res, next) => {           // eslint-disable-line no-unused-va
    START
 ══════════════════════════════════════════════════════════ */
 mongoose.connect(MONGODB_URI)
-  .then(() => {
+  .then(async () => {
     console.log("✅  MongoDB connected");
     app.listen(PORT, () => console.log(`🚀  Server on port ${PORT} | Provider: JAP`));
+
+    // ── Background Sync Setup ──────────────────────────────
+    // Check if DB has services already
+    const count = await ServiceCache.countDocuments();
+    if (count === 0) {
+      console.log("[SYNC] First run — syncing services from provider...");
+      syncServicesFromJAP();          // run immediately on first start
+    } else {
+      console.log(`[SYNC] DB has ${count} cached services — background sync scheduled`);
+      // Sync once at startup to refresh, but don't block
+      setTimeout(syncServicesFromJAP, 10000);   // 10s after startup
+    }
+
+    // Cron: sync every 1 hour (at minute 0 of every hour)
+    cron.schedule("0 * * * *", () => {
+      console.log("[CRON] Hourly sync triggered");
+      syncServicesFromJAP();
+    });
+    console.log("[CRON] Hourly service sync scheduled ✅");
   })
   .catch(e => { console.error("❌  MongoDB:", e.message); process.exit(1); });
