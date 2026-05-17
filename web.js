@@ -308,35 +308,29 @@ async function uploadToImgBB(buffer) {
    order    → single order ID
    orders   → multiple order IDs (comma-separated) for status/cancel/refill
 ══════════════════════════════════════════════════════════ */
-async function japAPI(params, _retry = false) {
+async function japAPI(params, _attempt = 0) {
+  const MAX_ATTEMPTS = 4;          // 4 attempts total
+  const TIMEOUTS     = [30000, 40000, 50000, 60000]; // grow per attempt
+  const DELAYS       = [2000,  4000,  8000];          // backoff between retries
+
   const payload = new URLSearchParams();
   payload.append("key",    JAP_API_KEY);
   payload.append("action", params.action);
 
-  // Add order
   if (params.action === "add") {
     payload.append("service",  String(params.service));
     payload.append("link",     String(params.link));
     payload.append("quantity", String(params.quantity));
-    if (params.runs)      payload.append("runs",      String(params.runs));
-    if (params.interval)  payload.append("interval",  String(params.interval));
-    if (params.comments)  payload.append("comments",  String(params.comments)); // Custom Comments
+    if (params.runs)     payload.append("runs",     String(params.runs));
+    if (params.interval) payload.append("interval", String(params.interval));
+    if (params.comments) payload.append("comments", String(params.comments));
   }
-
-  // Single order operations (status / refill)
-  if (["status", "refill"].includes(params.action) && params.order) {
+  if (["status", "refill"].includes(params.action) && params.order)
     payload.append("order", String(params.order));
-  }
-
-  // Multiple orders (status with orders / cancel / refill with orders)
-  if (params.orders) {
+  if (params.orders)
     payload.append("orders", String(params.orders));
-  }
 
-  // ── Log request ─────────────────────────────────────────
-  console.log("━━━ [JAP] REQUEST ━━━");
-  console.log("URL     :", JAP_API_URL);
-  console.log("Payload :", Object.fromEntries(payload));
+  console.log(`[JAP] ${params.action.toUpperCase()} attempt ${_attempt + 1}/${MAX_ATTEMPTS}`);
 
   try {
     const { status, data } = await axios.post(
@@ -353,48 +347,31 @@ async function japAPI(params, _retry = false) {
           "Origin":           "https://justanotherpanel.com",
           "X-Requested-With": "XMLHttpRequest",
           "Connection":       "keep-alive",
-          "Cache-Control":    "no-cache",
-          "Pragma":           "no-cache",
         },
-        timeout: 25000,
+        timeout: TIMEOUTS[_attempt] || 60000,
       }
     );
-
-    console.log("━━━ [JAP] RESPONSE ━━━");
-    console.log("HTTP Status :", status);
-    console.log("Body        :", JSON.stringify(data));
-
-    if (data && data.error) {
-      console.error("[JAP] Provider error:", data.error);
-      throw new Error(String(data.error));
-    }
+    if (data && data.error) throw new Error(String(data.error));
     return data;
 
   } catch (err) {
-    console.error("━━━ [JAP] ERROR ━━━");
+    const isTimeout  = !!err.request && !err.response;
+    const isRetryHTTP = err.response && [429, 503, 502, 504].includes(err.response.status);
+
+    if ((isTimeout || isRetryHTTP) && _attempt + 1 < MAX_ATTEMPTS) {
+      const delay = DELAYS[_attempt] || 8000;
+      console.warn(`[JAP] Attempt ${_attempt + 1} failed (${isTimeout ? "timeout" : err.response.status}). Retrying in ${delay / 1000}s...`);
+      await new Promise(r => setTimeout(r, delay));
+      return japAPI(params, _attempt + 1);
+    }
+
+    // Final failure
     if (err.response) {
-      console.error("HTTP Status  :", err.response.status);
-      console.error("Response Body:", JSON.stringify(err.response.data));
-      const retryable = [403, 429, 503].includes(err.response.status);
-      if (retryable && !_retry) {
-        const wait = err.response.status === 429 ? 3000 : 1000;
-        console.log(`[JAP] Retrying in ${wait}ms (status ${err.response.status})...`);
-        await new Promise(r => setTimeout(r, wait));
-        return japAPI(params, true);
-      }
       const msg = err.response.data?.error || err.response.data?.message || `HTTP ${err.response.status}`;
       throw new Error(msg);
     }
-    if (err.request) {
-      if (!_retry) {
-        console.log("[JAP] Timeout — retrying in 1s...");
-        await new Promise(r => setTimeout(r, 1000));
-        return japAPI(params, true);
-      }
-      throw new Error("Provider နှင့် ဆက်သွယ်မရပါ — ကြိုးစားမှု၌ retry ပြုလုပ်ပါ");
-    }
-    if (err.message.startsWith("[JAP]")) throw err;
-    throw new Error(err.message.replace(/\[JAP\]\s*/gi, ""));
+    if (isTimeout) throw new Error("ဆာဗာနှင့် ဆက်သွယ်မရပါ — ခဏစောင့်ပြီး ထပ်ကြိုးစားပါ");
+    throw new Error(err.message.replace(/\[JAP\]\s*/gi, "").trim() || "Unknown error");
   }
 }
 
@@ -571,10 +548,20 @@ let _svcCache = null, _svcCachedAt = 0;
 app.get("/api/provider/services", async (req, res) => {  // public — no guard needed
   try {
     const now = Date.now();
-    if (_svcCache && (now - _svcCachedAt) < 10 * 60 * 1000 && req.query.refresh !== "1")
+    if (_svcCache && (now - _svcCachedAt) < 30 * 60 * 1000 && req.query.refresh !== "1")
       return res.json(_svcCache);
 
-    const raw = await japAPI({ action: "services" });
+    // Try fresh fetch; if it fails and we have stale cache, serve stale
+    let raw;
+    try {
+      raw = await japAPI({ action: "services" });
+    } catch (fetchErr) {
+      if (_svcCache) {
+        console.warn("[SERVICES] Fresh fetch failed, serving stale cache:", fetchErr.message);
+        return res.json(_svcCache);
+      }
+      throw fetchErr;
+    }
 
     // JAP always returns Array — normalize to consistent shape
     const arr = (Array.isArray(raw) ? raw : Object.values(raw)).map(s => ({
