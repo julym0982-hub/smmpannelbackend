@@ -27,11 +27,11 @@ const upload = multer({
 const PORT        = process.env.PORT        || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET  = process.env.JWT_SECRET;
-const JAP_API_KEY   = process.env.JAP_API_KEY   || "";
+const SECSERS_API_KEY = process.env.SECSERS_API_KEY || "";
 const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
 const ADMIN_EMAILS  = (process.env.ADMIN_EMAILS || "")
   .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
-const JAP_API_URL = process.env.JAP_API_URL || "https://justanotherpanel.com/api/v2";
+const SECSERS_API_URL = process.env.SECSERS_API_URL || "https://secsers.com/api/v2";
 const MMK_RATE    = parseFloat(process.env.MMK_RATE || "4500");
 const MARKUP         = parseFloat(process.env.MARKUP   || "1.2");
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
@@ -39,7 +39,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 if (!MONGODB_URI) { console.error("❌  MONGODB_URI missing"); process.exit(1); }
 if (!JWT_SECRET)  { console.error("❌  JWT_SECRET missing");  process.exit(1); }
-if (!JAP_API_KEY)    console.warn("⚠️  JAP_API_KEY not set");
+if (!SECSERS_API_KEY) console.warn("⚠️  SECSERS_API_KEY not set");
 if (!IMGBB_API_KEY)  console.warn("⚠️  IMGBB_API_KEY not set — file upload won't work");
 
 const app = express();
@@ -58,7 +58,7 @@ app.use(helmet({
       scriptSrc:  ["'self'", "'unsafe-inline'", "https://api.imgbb.com"],
       styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       imgSrc:     ["'self'", "data:", "https://i.ibb.co", "https://*.ibb.co"],
-      connectSrc: ["'self'", "https://justanotherpanel.com", "https://api.imgbb.com"],
+      connectSrc: ["'self'", "https://secsers.com", "https://api.imgbb.com"],
       fontSrc:    ["'self'", "https://fonts.gstatic.com"],
     },
   },
@@ -329,13 +329,13 @@ async function uploadToImgBB(buffer) {
    order    → single order ID
    orders   → multiple order IDs (comma-separated) for status/cancel/refill
 ══════════════════════════════════════════════════════════ */
-async function japAPI(params, _attempt = 0) {
+async function providerAPI(params, _attempt = 0) {
   const MAX_ATTEMPTS = 4;          // 4 attempts total
   const TIMEOUTS     = [30000, 40000, 50000, 60000]; // grow per attempt
   const DELAYS       = [2000,  4000,  8000];          // backoff between retries
 
   const payload = new URLSearchParams();
-  payload.append("key",    JAP_API_KEY);
+  payload.append("key",    SECSERS_API_KEY);
   payload.append("action", params.action);
 
   if (params.action === "add") {
@@ -351,11 +351,11 @@ async function japAPI(params, _attempt = 0) {
   if (params.orders)
     payload.append("orders", String(params.orders));
 
-  console.log(`[JAP] ${params.action.toUpperCase()} attempt ${_attempt + 1}/${MAX_ATTEMPTS}`);
+  console.log(`[Provider] ${params.action.toUpperCase()} attempt ${_attempt + 1}/${MAX_ATTEMPTS}`);
 
   try {
     const { status, data } = await axios.post(
-      JAP_API_URL,
+      SECSERS_API_URL,
       payload.toString(),
       {
         headers: {
@@ -364,8 +364,8 @@ async function japAPI(params, _attempt = 0) {
           "Accept":           "application/json, text/javascript, */*; q=0.01",
           "Accept-Language":  "en-US,en;q=0.9",
           "Accept-Encoding":  "gzip, deflate, br",
-          "Referer":          "https://justanotherpanel.com/",
-          "Origin":           "https://justanotherpanel.com",
+          "Referer":          "https://secsers.com/",
+          "Origin":           "https://secsers.com",
           "X-Requested-With": "XMLHttpRequest",
           "Connection":       "keep-alive",
         },
@@ -381,9 +381,9 @@ async function japAPI(params, _attempt = 0) {
 
     if ((isTimeout || isRetryHTTP) && _attempt + 1 < MAX_ATTEMPTS) {
       const delay = DELAYS[_attempt] || 8000;
-      console.warn(`[JAP] Attempt ${_attempt + 1} failed (${isTimeout ? "timeout" : err.response.status}). Retrying in ${delay / 1000}s...`);
+      console.warn(`[Provider] Attempt ${_attempt + 1} failed (${isTimeout ? "timeout" : err.response.status}). Retrying in ${delay / 1000}s...`);
       await new Promise(r => setTimeout(r, delay));
-      return japAPI(params, _attempt + 1);
+      return providerAPI(params, _attempt + 1);
     }
 
     // Final failure
@@ -577,7 +577,7 @@ async function syncServicesFromJAP() {
   console.log("[SYNC] Fetching services from provider...");
 
   try {
-    const raw  = await japAPI({ action: "services" });
+    const raw  = await providerAPI({ action: "services" });
     const arr  = (Array.isArray(raw) ? raw : Object.values(raw)).map(s => ({
       service_id:   String(s.service || s.service_id || ""),
       name:         s.name         || "",
@@ -649,7 +649,7 @@ app.get("/api/provider/services", async (req, res) => {
  * JAP: { balance: "100.84292", currency: "USD" }
  */
 app.get("/api/provider/balance", guard, async (req, res) => {
-  try { res.json(await japAPI({ action: "balance" })); }
+  try { res.json(await providerAPI({ action: "balance" })); }
   catch (e) { res.status(502).json({ message: e.message }); }
 });
 
@@ -689,14 +689,14 @@ app.post("/api/orders", guard, async (req, res) => {
     let providerRes;
     try {
       // Build JAP add payload — include comments if present (Custom Comments type)
-      const japPayload = {
+      const providerPayload = {
         action:   "add",
         service:  serviceId,
         link:     link,
         quantity: quantity,
       };
-      if (comments) japPayload.comments = comments;
-      providerRes = await japAPI(japPayload);
+      if (comments) providerPayload.comments = comments;
+      providerRes = await providerAPI(providerPayload);
     } catch (provErr) {
       // Refund on failure
       user.balance += chargeMMK; user.balanceSpent -= chargeMMK; user.totalOrders -= 1;
@@ -763,7 +763,7 @@ app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
     if (!order) return res.status(404).json({ message: "Order not found" });
     if (!order.providerOrderId) return res.status(400).json({ message: "No provider order ID" });
 
-    const data = await japAPI({ action: "status", order: order.providerOrderId });
+    const data = await providerAPI({ action: "status", order: order.providerOrderId });
 
     // JAP field mapping:
     order.status     = data.status      || order.status;     // JAP: status (not orderStatus)
@@ -797,7 +797,7 @@ app.post("/api/orders/sync-bulk", guard, async (req, res) => {
     if (!pids.length) return res.json({ message: "No provider IDs found", updated: 0 });
 
     // JAP: use "orders" (plural) for multiple status check
-    const data = await japAPI({ action: "status", orders: pids.join(",") });
+    const data = await providerAPI({ action: "status", orders: pids.join(",") });
 
     let updated = 0;
     for (const o of orders) {
@@ -823,7 +823,7 @@ app.post("/api/orders/:id/refill", guard, async (req, res) => {
     if (!order) return res.status(404).json({ message: "Order not found" });
     if (!order.providerOrderId) return res.status(400).json({ message: "No provider order ID" });
 
-    const data = await japAPI({ action: "refill", order: order.providerOrderId });
+    const data = await providerAPI({ action: "refill", order: order.providerOrderId });
     // JAP response: { refill: "1" } → refill ID
     order.status = "Refill Requested";
     await order.save();
@@ -844,7 +844,7 @@ app.post("/api/orders/:id/sync-status", guard, async (req, res) => {
     if (!order.providerOrderId) return res.status(400).json({ message: "No provider order ID — cannot sync" });
 
     console.log(`[SYNC] Order ${order._id} → JAP #${order.providerOrderId}`);
-    const data = await japAPI({ action: "status", order: order.providerOrderId });
+    const data = await providerAPI({ action: "status", order: order.providerOrderId });
 
     // Map JAP fields → DB fields
     order.status     = data.status      || order.status;
@@ -902,7 +902,7 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
     // ── 2. Sync latest remains from JAP before canceling ──
     let freshRemains = order.remains;
     try {
-      const syncData = await japAPI({ action: "status", order: order.providerOrderId });
+      const syncData = await providerAPI({ action: "status", order: order.providerOrderId });
       freshRemains   = parseFloat(syncData.remains || 0);
       order.remains  = freshRemains;
       order.status   = syncData.status || order.status;
@@ -913,20 +913,20 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
 
     // ── 3. Call JAP cancel API ───────────────────────────
     console.log(`[CANCEL] Calling JAP cancel for order #${order.providerOrderId}`);
-    const japResponse = await japAPI({
+    const providerResponse = await providerAPI({
       action: "cancel",
       orders: String(order.providerOrderId),   // JAP uses "orders" (plural) even for single
     });
-    console.log("[CANCEL] JAP response:", JSON.stringify(japResponse));
+    console.log("[CANCEL] JAP response:", JSON.stringify(providerResponse));
 
     // ── 4. Parse JAP cancel response ────────────────────
     // JAP returns: [{ order: <id>, cancel: 1 }]  or  [{ order: <id>, cancel: { error: "..." } }]
     let cancelSuccess = false;
     let japErrMsg     = "";
 
-    if (Array.isArray(japResponse)) {
-      const entry = japResponse.find(r => String(r.order) === String(order.providerOrderId))
-                 || japResponse[0];
+    if (Array.isArray(providerResponse)) {
+      const entry = providerResponse.find(r => String(r.order) === String(order.providerOrderId))
+                 || providerResponse[0];
       if (entry) {
         if (entry.cancel === 1 || entry.cancel === "1") {
           cancelSuccess = true;
@@ -936,10 +936,10 @@ app.post("/api/orders/:id/cancel", guard, async (req, res) => {
           cancelSuccess = true;   // numeric non-error value = success
         }
       }
-    } else if (japResponse && typeof japResponse === "object") {
+    } else if (providerResponse && typeof providerResponse === "object") {
       // Some panels return a single object
-      if (japResponse.cancel === 1 || japResponse.cancel === "1") cancelSuccess = true;
-      else if (japResponse.error) japErrMsg = japResponse.error;
+      if (providerResponse.cancel === 1 || providerResponse.cancel === "1") cancelSuccess = true;
+      else if (providerResponse.error) japErrMsg = providerResponse.error;
       else cancelSuccess = true;
     }
 
@@ -1188,7 +1188,7 @@ app.use((err, req, res, next) => {           // eslint-disable-line no-unused-va
 mongoose.connect(MONGODB_URI)
   .then(async () => {
     console.log("✅  MongoDB connected");
-    app.listen(PORT, () => console.log(`🚀  Server on port ${PORT} | Provider: JAP`));
+    app.listen(PORT, () => console.log(`🚀  Server on port ${PORT} | Provider: Secsers`));
 
     // ── Background Sync Setup ──────────────────────────────
     // Check if DB has services already
