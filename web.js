@@ -709,14 +709,16 @@ app.get("/api/provider/services", async (req, res) => {
       });
 
     // Filter by mode
+    // ── Step 1: Blacklist always applies (regardless of mode) ──
+    // Any service with blacklisted:true is ALWAYS hidden from users
+    result = result.filter(s => !overrideMap[String(s.service_id)]?.blacklisted);
+
+    // ── Step 2: Whitelist only applies in whitelist mode ─────
     if (mode === "whitelist") {
       result = result.filter(s => overrideMap[String(s.service_id)]?.whitelisted);
       result.sort((a, b) =>
         (overrideMap[a.service_id]?.sort_order || 999) -
         (overrideMap[b.service_id]?.sort_order || 999));
-    } else if (mode === "blacklist") {
-      result = result.filter(s => !overrideMap[String(s.service_id)]?.blacklisted);
-      result.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
     } else {
       result.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
     }
