@@ -675,8 +675,12 @@ app.get("/api/provider/services", async (req, res) => {
     }
 
     const mode       = settingsDoc?.mode || "all";
-    const catMap     = settingsDoc?.customCategories
-      ? Object.fromEntries(settingsDoc.customCategories) : {};
+    // After .lean(), Mongoose Map becomes plain JS object — use directly
+    const catMap = settingsDoc?.customCategories
+      ? (settingsDoc.customCategories instanceof Map
+          ? Object.fromEntries(settingsDoc.customCategories)
+          : Object.assign({}, settingsDoc.customCategories))
+      : {};
     const overrideMap = {};
     overrides.forEach(o => { overrideMap[String(o.service_id)] = o; });
 
@@ -1255,7 +1259,11 @@ app.get("/api/admin/filter-settings", adminGuard, async (req, res) => {
   try {
     const s    = await FilterSettings.findOne().lean() || { mode: "all", customCategories: {} };
     const cats = await ServiceCache.distinct("category");
-    res.json({ mode: s.mode, customCategories: s.customCategories || {}, categories: cats });
+    // Convert Map to plain object for JSON response
+    const customCats = s.customCategories instanceof Map
+      ? Object.fromEntries(s.customCategories)
+      : (s.customCategories || {});
+    res.json({ mode: s.mode, customCategories: customCats, categories: cats });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
