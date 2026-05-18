@@ -565,16 +565,25 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
  * We normalize and cache 10 mins.
  */
 
-/* ── ServiceOverride Schema ─────────────────────────────
-   Admin မှ show/hide လုပ်မည့် services နှင့် custom names
-   overrides.length > 0 → whitelist mode (ရွေးထားသာ ပြ)
-   overrides.length = 0 → show all (ပုံမှန်)              */
-const serviceOverrideSchema = new mongoose.Schema({
-  service_id:   { type: String, required: true, unique: true },
-  custom_name:  { type: String, default: null },   // null = original name
-  enabled:      { type: Boolean, default: true },
-  sort_order:   { type: Number, default: 999 },
+/* ── FilterSettings — singleton doc ─────────────────────
+   mode: "all" | "whitelist" | "blacklist"              */
+const filterSettingsSchema = new mongoose.Schema({
+  mode:            { type: String, enum: ["all","whitelist","blacklist"], default: "all" },
+  customCategories:{ type: Map, of: String, default: {} },  // origName → customName
 }, { timestamps: true });
+const FilterSettings = mongoose.model("FilterSettings", filterSettingsSchema);
+
+/* ── ServiceOverride — per-service customisation ────────*/
+const serviceOverrideSchema = new mongoose.Schema({
+  service_id:      { type: String, required: true, unique: true },
+  custom_name:     { type: String, default: null },
+  custom_category: { type: String, default: null },
+  whitelisted:     { type: Boolean, default: false },
+  blacklisted:     { type: Boolean, default: false },
+  sort_order:      { type: Number, default: 999 },
+}, { timestamps: true });
+serviceOverrideSchema.index({ whitelisted: 1 });
+serviceOverrideSchema.index({ blacklisted: 1 });
 const ServiceOverride = mongoose.model("ServiceOverride", serviceOverrideSchema);
 
 /* ══════════════════════════════════════════════════════════
@@ -630,13 +639,14 @@ async function syncServicesFromJAP() {
  */
 app.get("/api/provider/services", async (req, res) => {
   try {
-    const [services, overrides] = await Promise.all([
+    const [services, overrides, settingsDoc] = await Promise.all([
       ServiceCache.find({}).select("-__v -createdAt -updatedAt").lean(),
-      ServiceOverride.find({ enabled: true }).lean(),
+      ServiceOverride.find({}).lean(),
+      FilterSettings.findOne().lean(),
     ]);
 
     if (services.length === 0) {
-      console.log("[SERVICES] DB empty, triggering background sync...");
+      console.log("[SERVICES] DB empty — triggering background sync...");
       syncServicesFromJAP();
       return res.status(202).json({
         message: "Services ကို ပြင်ဆင်နေပါသည် — ခဏစောင့်ပြီး ပြန်ကြည့်ပါ (30s)",
@@ -644,29 +654,36 @@ app.get("/api/provider/services", async (req, res) => {
       });
     }
 
-    let result;
+    const mode       = settingsDoc?.mode || "all";
+    const catMap     = settingsDoc?.customCategories
+      ? Object.fromEntries(settingsDoc.customCategories) : {};
+    const overrideMap = {};
+    overrides.forEach(o => { overrideMap[String(o.service_id)] = o; });
 
-    if (overrides.length > 0) {
-      // ── Whitelist mode: only show admin-selected services ──
-      const overrideMap = {};
-      overrides.forEach(o => { overrideMap[String(o.service_id)] = o; });
+    // Apply name / category overrides to every service
+    let result = services.map(s => {
+      const o = overrideMap[String(s.service_id)];
+      return {
+        ...s,
+        name:     (o?.custom_name     || s.name),
+        category: (o?.custom_category || catMap[s.category] || s.category),
+      };
+    });
 
-      const svcMap = {};
-      services.forEach(s => { svcMap[String(s.service_id)] = s; });
-
-      result = overrides
-        .filter(o => svcMap[o.service_id])   // must exist in DB cache
-        .sort((a, b) => (a.sort_order || 999) - (b.sort_order || 999))
-        .map(o => ({
-          ...svcMap[o.service_id],
-          name: o.custom_name || svcMap[o.service_id].name,  // custom name override
-        }));
+    // Filter by mode
+    if (mode === "whitelist") {
+      result = result.filter(s => overrideMap[String(s.service_id)]?.whitelisted);
+      result.sort((a, b) =>
+        (overrideMap[a.service_id]?.sort_order || 999) -
+        (overrideMap[b.service_id]?.sort_order || 999));
+    } else if (mode === "blacklist") {
+      result = result.filter(s => !overrideMap[String(s.service_id)]?.blacklisted);
+      result.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
     } else {
-      // ── Show all services (no filter set) ─────────────────
-      result = services.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
+      result.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
     }
 
-    console.log(`[SERVICES] Served ${result.length} services (${overrides.length > 0 ? "whitelist" : "all"} mode)`);
+    console.log(`[SERVICES] ${result.length} services served (mode: ${mode})`);
     res.json(result);
 
   } catch (e) {
@@ -1216,65 +1233,103 @@ app.use((err, req, res, next) => {           // eslint-disable-line no-unused-va
 
 
 /* ══════════════════════════════════════════════════════════
-   ADMIN — Service Override Management
-   GET    /api/admin/service-overrides        → list all
-   POST   /api/admin/service-overrides        → add/update
-   DELETE /api/admin/service-overrides/:id    → remove
-   POST   /api/admin/service-overrides/clear  → remove all (show all mode)
+   ADMIN — Filter Settings (mode + category names)
 ══════════════════════════════════════════════════════════ */
 
-app.get("/api/admin/service-overrides", adminGuard, async (req, res) => {
+// GET current settings
+app.get("/api/admin/filter-settings", adminGuard, async (req, res) => {
   try {
-    const overrides = await ServiceOverride.find({}).sort({ sort_order: 1, service_id: 1 }).lean();
-    // Attach original name from ServiceCache for reference
-    const ids      = overrides.map(o => o.service_id);
-    const cached   = await ServiceCache.find({ service_id: { $in: ids } }).select("service_id name category rate").lean();
-    const cacheMap = {};
-    cached.forEach(c => { cacheMap[c.service_id] = c; });
-    const result   = overrides.map(o => ({
-      ...o,
-      original_name: cacheMap[o.service_id]?.name     || "",
-      category:      cacheMap[o.service_id]?.category  || "",
-      rate:          cacheMap[o.service_id]?.rate       || "",
-    }));
-    res.json({ overrides: result, whitelist_mode: overrides.length > 0 });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+    const s = await FilterSettings.findOne().lean() || { mode: "all", customCategories: {} };
+    // Get unique categories from cache
+    const cats = await ServiceCache.distinct("category");
+    res.json({ mode: s.mode, customCategories: s.customCategories || {}, categories: cats });
+  } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+// PUT update mode + category names
+app.put("/api/admin/filter-settings", adminGuard, async (req, res) => {
+  try {
+    const { mode, customCategories } = req.body;
+    const allowed = ["all","whitelist","blacklist"];
+    if (mode && !allowed.includes(mode))
+      return res.status(400).json({ message: "mode must be all/whitelist/blacklist" });
+    const update = {};
+    if (mode)             update.mode            = mode;
+    if (customCategories) update.customCategories = customCategories;
+    const doc = await FilterSettings.findOneAndUpdate(
+      {}, { $set: update }, { upsert: true, new: true }
+    );
+    res.json({ message: "Settings saved", settings: doc });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+/* ══════════════════════════════════════════════════════════
+   ADMIN — Service Overrides (name / WL / BL per service)
+══════════════════════════════════════════════════════════ */
+
+// GET all services from cache + their overrides (paginated + search)
+app.get("/api/admin/services-cache", adminGuard, async (req, res) => {
+  try {
+    const page     = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit    = Math.min(50, parseInt(req.query.limit) || 30);
+    const q        = (req.query.q || "").toLowerCase();
+    const catFilter= req.query.category || "";
+
+    let filter = {};
+    if (q) filter.$or = [
+      { service_id: { $regex: q, $options: "i" } },
+      { name:       { $regex: q, $options: "i" } },
+    ];
+    if (catFilter) filter.category = catFilter;
+
+    const [services, total, overrides] = await Promise.all([
+      ServiceCache.find(filter).sort({ service_id: 1 })
+        .skip((page-1)*limit).limit(limit).lean(),
+      ServiceCache.countDocuments(filter),
+      ServiceOverride.find({}).lean(),
+    ]);
+
+    const oMap = {};
+    overrides.forEach(o => { oMap[o.service_id] = o; });
+
+    const result = services.map(s => ({
+      ...s,
+      override: oMap[s.service_id] || null,
+    }));
+
+    res.json({ services: result, total, page, pages: Math.ceil(total/limit) });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
+
+// POST upsert override for one service
 app.post("/api/admin/service-overrides", adminGuard, async (req, res) => {
   try {
-    const { service_id, custom_name, enabled, sort_order } = req.body;
+    const { service_id, custom_name, custom_category,
+            whitelisted, blacklisted, sort_order } = req.body;
     if (!service_id) return res.status(400).json({ message: "service_id required" });
 
-    const exists = await ServiceCache.findOne({ service_id: String(service_id) });
-    if (!exists) return res.status(404).json({ message: `Service ID ${service_id} not found in DB cache` });
+    const setFields = {};
+    if (custom_name     !== undefined) setFields.custom_name     = custom_name     || null;
+    if (custom_category !== undefined) setFields.custom_category = custom_category || null;
+    if (whitelisted     !== undefined) setFields.whitelisted      = !!whitelisted;
+    if (blacklisted     !== undefined) setFields.blacklisted      = !!blacklisted;
+    if (sort_order      !== undefined) setFields.sort_order       = sort_order      || 999;
 
     const doc = await ServiceOverride.findOneAndUpdate(
       { service_id: String(service_id) },
-      { $set: {
-          custom_name:  custom_name  || null,
-          enabled:      enabled      !== false,
-          sort_order:   sort_order   || 999,
-        }
-      },
+      { $set: setFields },
       { upsert: true, new: true }
     );
-    res.json({ message: "Service override saved", override: doc });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+    res.json({ message: "Saved", override: doc });
+  } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
+// DELETE remove override for one service
 app.delete("/api/admin/service-overrides/:service_id", adminGuard, async (req, res) => {
   try {
     await ServiceOverride.deleteOne({ service_id: req.params.service_id });
-    res.json({ message: "Service removed from whitelist" });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post("/api/admin/service-overrides/clear", adminGuard, async (req, res) => {
-  try {
-    await ServiceOverride.deleteMany({});
-    res.json({ message: "All overrides cleared — showing all services now" });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+    res.json({ message: "Override removed" });
+  } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
 /* ══════════════════════════════════════════════════════════
