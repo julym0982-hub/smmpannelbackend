@@ -564,6 +564,19 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
  * [{ service, name, type, category, rate, min, max, refill, cancel }, ...]
  * We normalize and cache 10 mins.
  */
+
+/* ── ServiceOverride Schema ─────────────────────────────
+   Admin မှ show/hide လုပ်မည့် services နှင့် custom names
+   overrides.length > 0 → whitelist mode (ရွေးထားသာ ပြ)
+   overrides.length = 0 → show all (ပုံမှန်)              */
+const serviceOverrideSchema = new mongoose.Schema({
+  service_id:   { type: String, required: true, unique: true },
+  custom_name:  { type: String, default: null },   // null = original name
+  enabled:      { type: Boolean, default: true },
+  sort_order:   { type: Number, default: 999 },
+}, { timestamps: true });
+const ServiceOverride = mongoose.model("ServiceOverride", serviceOverrideSchema);
+
 /* ══════════════════════════════════════════════════════════
    BACKGROUND SYNC — JAP → MongoDB
    Runs every 1 hour. User never waits for JAP API.
@@ -617,25 +630,44 @@ async function syncServicesFromJAP() {
  */
 app.get("/api/provider/services", async (req, res) => {
   try {
-    const services = await ServiceCache.find({})
-      .select("-__v -createdAt -updatedAt")
-      .lean();
+    const [services, overrides] = await Promise.all([
+      ServiceCache.find({}).select("-__v -createdAt -updatedAt").lean(),
+      ServiceOverride.find({ enabled: true }).lean(),
+    ]);
 
     if (services.length === 0) {
-      // DB empty (first run) — trigger sync and tell frontend to retry
       console.log("[SERVICES] DB empty, triggering background sync...");
-      syncServicesFromJAP();    // background, don't await
+      syncServicesFromJAP();
       return res.status(202).json({
         message: "Services ကို ပြင်ဆင်နေပါသည် — ခဏစောင့်ပြီး ပြန်ကြည့်ပါ (30s)",
-        syncing: true,
-        services: [],
+        syncing: true, services: [],
       });
     }
 
-    // Sort by numeric service_id
-    services.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
-    console.log(`[SERVICES] Served ${services.length} services from DB`);
-    res.json(services);
+    let result;
+
+    if (overrides.length > 0) {
+      // ── Whitelist mode: only show admin-selected services ──
+      const overrideMap = {};
+      overrides.forEach(o => { overrideMap[String(o.service_id)] = o; });
+
+      const svcMap = {};
+      services.forEach(s => { svcMap[String(s.service_id)] = s; });
+
+      result = overrides
+        .filter(o => svcMap[o.service_id])   // must exist in DB cache
+        .sort((a, b) => (a.sort_order || 999) - (b.sort_order || 999))
+        .map(o => ({
+          ...svcMap[o.service_id],
+          name: o.custom_name || svcMap[o.service_id].name,  // custom name override
+        }));
+    } else {
+      // ── Show all services (no filter set) ─────────────────
+      result = services.sort((a, b) => parseInt(a.service_id) - parseInt(b.service_id));
+    }
+
+    console.log(`[SERVICES] Served ${result.length} services (${overrides.length > 0 ? "whitelist" : "all"} mode)`);
+    res.json(result);
 
   } catch (e) {
     console.error("[SERVICES ERR]", e.message);
@@ -1180,6 +1212,69 @@ app.use((err, req, res, next) => {           // eslint-disable-line no-unused-va
       ? "An internal error occurred. Please try again."
       : err.message || "Unexpected error",
   });
+});
+
+
+/* ══════════════════════════════════════════════════════════
+   ADMIN — Service Override Management
+   GET    /api/admin/service-overrides        → list all
+   POST   /api/admin/service-overrides        → add/update
+   DELETE /api/admin/service-overrides/:id    → remove
+   POST   /api/admin/service-overrides/clear  → remove all (show all mode)
+══════════════════════════════════════════════════════════ */
+
+app.get("/api/admin/service-overrides", adminGuard, async (req, res) => {
+  try {
+    const overrides = await ServiceOverride.find({}).sort({ sort_order: 1, service_id: 1 }).lean();
+    // Attach original name from ServiceCache for reference
+    const ids      = overrides.map(o => o.service_id);
+    const cached   = await ServiceCache.find({ service_id: { $in: ids } }).select("service_id name category rate").lean();
+    const cacheMap = {};
+    cached.forEach(c => { cacheMap[c.service_id] = c; });
+    const result   = overrides.map(o => ({
+      ...o,
+      original_name: cacheMap[o.service_id]?.name     || "",
+      category:      cacheMap[o.service_id]?.category  || "",
+      rate:          cacheMap[o.service_id]?.rate       || "",
+    }));
+    res.json({ overrides: result, whitelist_mode: overrides.length > 0 });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post("/api/admin/service-overrides", adminGuard, async (req, res) => {
+  try {
+    const { service_id, custom_name, enabled, sort_order } = req.body;
+    if (!service_id) return res.status(400).json({ message: "service_id required" });
+
+    const exists = await ServiceCache.findOne({ service_id: String(service_id) });
+    if (!exists) return res.status(404).json({ message: `Service ID ${service_id} not found in DB cache` });
+
+    const doc = await ServiceOverride.findOneAndUpdate(
+      { service_id: String(service_id) },
+      { $set: {
+          custom_name:  custom_name  || null,
+          enabled:      enabled      !== false,
+          sort_order:   sort_order   || 999,
+        }
+      },
+      { upsert: true, new: true }
+    );
+    res.json({ message: "Service override saved", override: doc });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.delete("/api/admin/service-overrides/:service_id", adminGuard, async (req, res) => {
+  try {
+    await ServiceOverride.deleteOne({ service_id: req.params.service_id });
+    res.json({ message: "Service removed from whitelist" });
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post("/api/admin/service-overrides/clear", adminGuard, async (req, res) => {
+  try {
+    await ServiceOverride.deleteMany({});
+    res.json({ message: "All overrides cleared — showing all services now" });
+  } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 /* ══════════════════════════════════════════════════════════
