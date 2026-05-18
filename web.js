@@ -661,14 +661,23 @@ app.get("/api/provider/services", async (req, res) => {
     overrides.forEach(o => { overrideMap[String(o.service_id)] = o; });
 
     // Apply name / category overrides to every service
-    let result = services.map(s => {
-      const o = overrideMap[String(s.service_id)];
-      return {
-        ...s,
-        name:     (o?.custom_name     || s.name),
-        category: (o?.custom_category || catMap[s.category] || s.category),
-      };
-    });
+    // Also auto-remove any JAP-exclusive services (category or name contains "JAP")
+    const JAP_PATTERNS = /\bjap\b|jap exclusive|justanotherpanel/i;
+
+    let result = services
+      .filter(s => {
+        const cat  = (s.category || '').toLowerCase();
+        const name = (s.name     || '').toLowerCase();
+        return !JAP_PATTERNS.test(cat) && !JAP_PATTERNS.test(name);
+      })
+      .map(s => {
+        const o = overrideMap[String(s.service_id)];
+        return {
+          ...s,
+          name:     (o?.custom_name     || s.name),
+          category: (o?.custom_category || catMap[s.category] || s.category),
+        };
+      });
 
     // Filter by mode
     if (mode === "whitelist") {
@@ -1312,6 +1321,22 @@ app.use((err, req, res, next) => {           // eslint-disable-line no-unused-va
   });
 });
 
+
+
+/* POST /api/admin/resync-services
+   Clears ALL cached services and fetches fresh from Secsers  */
+app.post("/api/admin/resync-services", adminGuard, async (req, res) => {
+  try {
+    const deleted = await ServiceCache.deleteMany({});
+    console.log(`[RESYNC] Cleared ${deleted.deletedCount} cached services`);
+    // Trigger background sync immediately
+    syncServicesFromJAP();   // function name kept for compatibility
+    res.json({
+      message: `Cache cleared (${deleted.deletedCount} services removed). Fresh sync started — wait 30-60 seconds then refresh.`,
+      cleared: deleted.deletedCount,
+    });
+  } catch(e) { res.status(500).json({ message: e.message }); }
+});
 
 /* ════════════════════════════════════════════════════════
    404 + Global Error Handler
