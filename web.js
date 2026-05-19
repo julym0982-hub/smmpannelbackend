@@ -1271,19 +1271,30 @@ app.patch("/api/admin/users/:id/balance", adminGuard, async (req, res) => {
 
 app.get("/api/admin/filter-settings", adminGuard, async (req, res) => {
   try {
-    const s    = await FilterSettings.findOne().lean() || { mode: "all", customCategories: {} };
+    // Get or create settings document
+    let s = await FilterSettings.findOne().lean();
+    if (!s) {
+      s = await FilterSettings.create({ mode: "all", customCategories: {}, hiddenCategories: [] });
+      s = s.toObject();
+    }
+
     const cats = await ServiceCache.distinct("category");
-    // Convert Map to plain object for JSON response
-    const customCats = s.customCategories instanceof Map
+
+    // Convert Mongoose Map → plain object
+    const customCats = (s.customCategories instanceof Map)
       ? Object.fromEntries(s.customCategories)
-      : (s.customCategories || {});
+      : Object.assign({}, s.customCategories || {});
+
     res.json({
-      mode:             s.mode,
+      mode:             s.mode             || "all",
       customCategories: customCats,
-      hiddenCategories: s.hiddenCategories || [],
-      categories:       cats,
+      hiddenCategories: s.hiddenCategories  || [],
+      categories:       cats.filter(Boolean).sort(),  // remove empty/null, sort A-Z
     });
-  } catch(e) { res.status(500).json({ message: e.message }); }
+  } catch(e) {
+    console.error("[FILTER-SETTINGS GET]", e.message);
+    res.status(500).json({ message: e.message });
+  }
 });
 
 app.put("/api/admin/filter-settings", adminGuard, async (req, res) => {
