@@ -568,8 +568,9 @@ app.post("/api/auth/change-password", guard, async (req, res) => {
 /* ── FilterSettings — singleton doc ─────────────────────
    mode: "all" | "whitelist" | "blacklist"              */
 const filterSettingsSchema = new mongoose.Schema({
-  mode:            { type: String, enum: ["all","whitelist","blacklist"], default: "all" },
-  customCategories:{ type: Map, of: String, default: {} },  // origName → customName
+  mode:             { type: String, enum: ["all","whitelist","blacklist"], default: "all" },
+  customCategories: { type: Map, of: String, default: {} },   // origName → customName
+  hiddenCategories: { type: [String], default: [] },           // hidden category names
 }, { timestamps: true });
 const FilterSettings = mongoose.model("FilterSettings", filterSettingsSchema);
 
@@ -709,9 +710,20 @@ app.get("/api/provider/services", async (req, res) => {
       });
 
     // Filter by mode
-    // ── Step 1: Blacklist always applies (regardless of mode) ──
-    // Any service with blacklisted:true is ALWAYS hidden from users
-    result = result.filter(s => !overrideMap[String(s.service_id)]?.blacklisted);
+    // ── Step 1: Hidden categories — hide all services in that category ──
+    const hiddenCats = new Set(
+      (settingsDoc?.hiddenCategories || []).map(c => c.toLowerCase())
+    );
+
+    // ── Step 2: Blacklist always applies (regardless of mode) ──
+    result = result.filter(s => {
+      // Hide if category is hidden
+      const cat = (s.category || '').toLowerCase();
+      if (hiddenCats.has(cat)) return false;
+      // Hide if service is blacklisted
+      if (overrideMap[String(s.service_id)]?.blacklisted) return false;
+      return true;
+    });
 
     // ── Step 2: Whitelist only applies in whitelist mode ─────
     if (mode === "whitelist") {
@@ -1265,19 +1277,25 @@ app.get("/api/admin/filter-settings", adminGuard, async (req, res) => {
     const customCats = s.customCategories instanceof Map
       ? Object.fromEntries(s.customCategories)
       : (s.customCategories || {});
-    res.json({ mode: s.mode, customCategories: customCats, categories: cats });
+    res.json({
+      mode:             s.mode,
+      customCategories: customCats,
+      hiddenCategories: s.hiddenCategories || [],
+      categories:       cats,
+    });
   } catch(e) { res.status(500).json({ message: e.message }); }
 });
 
 app.put("/api/admin/filter-settings", adminGuard, async (req, res) => {
   try {
-    const { mode, customCategories } = req.body;
+    const { mode, customCategories, hiddenCategories } = req.body;
     const allowed = ["all","whitelist","blacklist"];
     if (mode && !allowed.includes(mode))
       return res.status(400).json({ message: "mode must be all/whitelist/blacklist" });
     const update = {};
-    if (mode !== undefined)             update.mode            = mode;
-    if (customCategories !== undefined) update.customCategories = customCategories;
+    if (mode !== undefined)             update.mode             = mode;
+    if (customCategories !== undefined) update.customCategories  = customCategories;
+    if (hiddenCategories !== undefined) update.hiddenCategories  = hiddenCategories;
     const doc = await FilterSettings.findOneAndUpdate(
       {}, { $set: update }, { upsert: true, new: true }
     );
