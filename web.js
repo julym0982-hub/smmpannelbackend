@@ -339,12 +339,16 @@ async function providerAPI(params, _attempt = 0) {
   payload.append("action", params.action);
 
   if (params.action === "add") {
-    payload.append("service",  String(params.service));
-    payload.append("link",     String(params.link));
-    payload.append("quantity", String(params.quantity));
+    payload.append("service", String(params.service));
+    payload.append("link",    String(params.link));
+    // Custom Comments: send "comments" INSTEAD of "quantity"
+    if (params.comments && params.comments.trim()) {
+      payload.append("comments", String(params.comments).trim());
+    } else {
+      payload.append("quantity", String(params.quantity));
+    }
     if (params.runs)     payload.append("runs",     String(params.runs));
     if (params.interval) payload.append("interval", String(params.interval));
-    if (params.comments) payload.append("comments", String(params.comments));
   }
   if (["status", "refill"].includes(params.action) && params.order)
     payload.append("order", String(params.order));
@@ -768,8 +772,12 @@ app.post("/api/orders", guard, async (req, res) => {
   session.startTransaction();
   try {
     const { serviceId, serviceName, category, link, quantity, chargeMMK, comments } = req.body;
-    if (!serviceId || !link || !quantity || !chargeMMK)
-      return res.status(400).json({ message: "serviceId, link, quantity, chargeMMK required" });
+    // Custom Comments: quantity derived from comment count, so it may come as 0 with comments
+    const isCustomComments = !!(comments && comments.trim());
+    if (!serviceId || !link || !chargeMMK)
+      return res.status(400).json({ message: "serviceId, link, chargeMMK required" });
+    if (!isCustomComments && !quantity)
+      return res.status(400).json({ message: "quantity required for non-Custom Comments orders" });
 
     const user = await User.findById(req.uid).session(session);
     if (!user) return res.status(404).json({ message: "User not found" });
